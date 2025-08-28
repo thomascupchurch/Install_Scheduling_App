@@ -8,6 +8,26 @@ export default function ControlPanel() {
   const fileInput = useRef();
   const [imported, setImported] = useState(null);
   const [error, setError] = useState(null);
+  // Home base state
+  const [homeBase, setHomeBase] = useState('');
+  const [homeBaseSaved, setHomeBaseSaved] = useState(false);
+
+  // Load home base on mount
+  useEffect(() => {
+    fetch('/api/settings/home_base')
+      .then(res => res.json())
+      .then(data => setHomeBase(data.home_base || ''));
+  }, []);
+
+  const handleHomeBaseSave = async () => {
+    setHomeBaseSaved(false);
+    const res = await fetch('/api/settings/home_base', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ home_base: homeBase })
+    });
+    if (res.ok) setHomeBaseSaved(true);
+  };
 
   const handleImport = async e => {
     e.preventDefault();
@@ -39,6 +59,21 @@ export default function ControlPanel() {
   return (
     <div>
       <h2>Control Panel</h2>
+      {/* Home Base Location */}
+      <div style={{ marginBottom: 20 }}>
+        <label>
+          Home Base Address:
+          <input
+            type="text"
+            value={homeBase}
+            onChange={e => { setHomeBase(e.target.value); setHomeBaseSaved(false); }}
+            style={{ marginLeft: 8, width: 320 }}
+            placeholder="123 Main St, City, State ZIP"
+          />
+        </label>
+        <button onClick={handleHomeBaseSave} style={{ marginLeft: 8 }}>Save</button>
+        {homeBaseSaved && <span style={{ color: 'green', marginLeft: 8 }}>Saved!</span>}
+      </div>
       <div>
         <label>
           Example Setting:

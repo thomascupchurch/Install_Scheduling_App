@@ -11,6 +11,7 @@ const upload = multer({ dest: 'uploads/' });
 app.use(express.json());
 
 // Database setup
+
 let db;
 (async () => {
   db = await open({
@@ -26,12 +27,14 @@ let db;
     start_time TEXT,
     end_time TEXT,
     description TEXT,
-    man_hours REAL
+    man_hours REAL,
+    address TEXT
   )`);
   // Add columns for migration if missing
   try { await db.exec('ALTER TABLE schedules ADD COLUMN man_hours REAL'); } catch {}
   try { await db.exec('ALTER TABLE schedules ADD COLUMN start_time TEXT'); } catch {}
   try { await db.exec('ALTER TABLE schedules ADD COLUMN end_time TEXT'); } catch {}
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN address TEXT'); } catch {}
   // Installers table
   await db.exec(`CREATE TABLE IF NOT EXISTS installers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,7 +48,31 @@ let db;
     FOREIGN KEY (schedule_id) REFERENCES schedules(id) ON DELETE CASCADE,
     FOREIGN KEY (installer_id) REFERENCES installers(id) ON DELETE CASCADE
   )`);
+  // Settings table for home base
+  await db.exec(`CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  )`);
 })();
+
+// Home base API
+app.get('/api/settings/home_base', async (req, res) => {
+  const row = await db.get('SELECT value FROM settings WHERE key = ?', ['home_base']);
+  res.json({ home_base: row ? row.value : '' });
+});
+
+app.post('/api/settings/home_base', async (req, res) => {
+  const { home_base } = req.body;
+  await db.run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['home_base', home_base]);
+  res.json({ success: true });
+});
+
+// Update job address
+app.patch('/api/schedules/:id/address', async (req, res) => {
+  const { address } = req.body;
+  await db.run('UPDATE schedules SET address = ? WHERE id = ?', [address, req.params.id]);
+  res.json({ success: true });
+});
 
 
 // Schedules routes
@@ -71,7 +98,6 @@ app.get('/api/schedules/:job_number', async (req, res) => {
 
 app.post('/api/schedules', async (req, res) => {
   const { job_number, title, date, start_time, end_time, description, installers, man_hours, override } = req.body;
-  try {
     // Enforce 8-hour limit per installer per day unless override
     if (Array.isArray(installers) && installers.length && man_hours && !override) {
       const day = date.slice(0, 10);
@@ -102,10 +128,9 @@ app.post('/api/schedules', async (req, res) => {
     res.status(400).json({ error: e.message });
   }
 });
-
-// PATCH endpoint to update description and man_hours
+// PATCH endpoint to update description, man_hours, installers, address, etc.
 app.patch('/api/schedules/:id', async (req, res) => {
-  const { description, man_hours, installers, date, start_time, end_time, override } = req.body;
+  const { description, man_hours, date, start_time, end_time, installers, address, override } = req.body;
   const { id } = req.params;
   try {
     // Enforce 8-hour limit per installer per day unless override
@@ -140,6 +165,7 @@ app.patch('/api/schedules/:id', async (req, res) => {
     if (date !== undefined) { updates.push('date = ?'); params.push(date); }
     if (start_time !== undefined) { updates.push('start_time = ?'); params.push(start_time); }
     if (end_time !== undefined) { updates.push('end_time = ?'); params.push(end_time); }
+    if (address !== undefined) { updates.push('address = ?'); params.push(address); }
     if (updates.length) {
       await db.run(`UPDATE schedules SET ${updates.join(', ')} WHERE id = ?`, [...params, id]);
     }
@@ -185,11 +211,23 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
     const date = job['Promise Date'] || job['Date Setup'] || job['Date'] || '';
     const description = job['Description'] || '';
     const man_hours = job['Man Hours'] || job['Estimated Man-Hours'] || job['Estimated Man Hours'] || null;
+    // Concatenate address fields in order
+    const addressParts = [
+      job['Add. Line 1'],
+      job['Add. Line 2'],
+      job['Add. Line 3'],
+      job['Alt Add. Line 1'],
+      job['Alt Add. Line 2'],
+      job['Alt Add. Line 3'],
+      job['Zip'],
+      job['State']
+    ];
+    const address = addressParts.filter(Boolean).join(', ');
     if (!job_number || !title || !date) continue;
     try {
       await db.run(
-        'INSERT OR IGNORE INTO schedules (job_number, title, date, description, installer_id, man_hours) VALUES (?, ?, ?, ?, ?, ?)',
-        [job_number, title, date, description, null, man_hours]
+        'INSERT OR IGNORE INTO schedules (job_number, title, date, description, man_hours, address) VALUES (?, ?, ?, ?, ?, ?)',
+        [job_number, title, date, description, man_hours, address]
       );
       imported++;
     } catch {}

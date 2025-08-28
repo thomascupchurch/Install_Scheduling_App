@@ -74,12 +74,13 @@ export default function CalendarView() {
   const [events, setEvents] = useState([]);
   const [selectedEvent, setSelectedEvent] = useState(null);
   const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({ title: '', job_number: '', date: '', description: '', man_hours: '', installers: [], core_hours_override: false });
+  const [form, setForm] = useState({ title: '', job_number: '', date: '', description: '', man_hours: '', installers: [], core_hours_override: false, address: '' });
   const [jobNumbers, setJobNumbers] = useState([]);
   const [jobNumberQuery, setJobNumberQuery] = useState('');
   const [editDesc, setEditDesc] = useState('');
   const [editManHours, setEditManHours] = useState('');
   const [editInstallers, setEditInstallers] = useState([]);
+  const [editAddress, setEditAddress] = useState('');
   const [overrideLimit, setOverrideLimit] = useState(false);
   const [editOverrideLimit, setEditOverrideLimit] = useState(false);
   const [editCoreHoursOverride, setEditCoreHoursOverride] = useState(false);
@@ -153,6 +154,7 @@ export default function CalendarView() {
     } else {
       setEditInstallers([]);
     }
+    setEditAddress(event.resource.address || '');
     setEditCoreHoursOverride(!!event.resource.core_hours_override);
   };
 
@@ -210,6 +212,7 @@ export default function CalendarView() {
         description: editDesc,
         man_hours: editManHours !== '' ? Number(editManHours) : undefined,
         installers: editInstallers,
+        address: editAddress,
         core_hours_override: !!editCoreHoursOverride
       })
     });
@@ -291,6 +294,7 @@ export default function CalendarView() {
                 return inst ? inst.name : null;
               }).filter(Boolean).join(', ')
             : 'None'}</div>
+          <div><b>Address:</b> {selectedEvent.address || ''}</div>
           {/* Show all fields for the job */}
           <div style={{ marginTop: 10 }}>
             <b>All Info:</b>
@@ -311,6 +315,12 @@ export default function CalendarView() {
               min="0"
               step="0.1"
               style={{ marginRight: 8, width: 100 }}
+            />
+            <input
+              value={editAddress}
+              onChange={e => setEditAddress(e.target.value)}
+              placeholder="Edit address"
+              style={{ marginRight: 8, width: 220 }}
             />
             <select
               multiple
@@ -398,6 +408,7 @@ export default function CalendarView() {
               </label>
             </div>
             <input name="date" value={form.date} onChange={handleFormChange} type="datetime-local" required />
+            <input name="address" value={form.address} onChange={handleFormChange} placeholder="Address (optional)" style={{ margin: '8px 0', width: 220 }} />
             <select
               name="installers"
               multiple
