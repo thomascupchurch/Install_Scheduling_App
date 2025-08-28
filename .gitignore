@@ -1,0 +1,15 @@
+# Ignore node_modules and build artifacts
+node_modules/
+build/
+dist/
+.env
+.DS_Store
+*.log
+/frontend/node_modules/
+/backend/node_modules/
+/frontend/build/
+/backend/build/
+/frontend/dist/
+/backend/dist/
+uploads/
+schedules.db
