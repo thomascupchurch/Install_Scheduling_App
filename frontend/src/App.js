@@ -12,7 +12,7 @@ function App() {
   return (
     <CoreHoursProvider>
       <div style={{ maxWidth: 900, margin: '2rem auto', fontFamily: 'sans-serif' }}>
-        <h1>Install Scheduling App</h1>
+  <h1>LSI Install Scheduling</h1>
         <nav style={{ marginBottom: 20 }}>
           <button onClick={() => setTab('calendar')}>Calendar</button>
           <button onClick={() => setTab('schedules')}>Schedules Table</button>

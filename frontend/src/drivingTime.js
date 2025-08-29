@@ -1,7 +1,8 @@
 // Frontend utility to request driving time (minutes) from backend cached endpoint
 // Usage: await getDrivingTimeMinutes('origin address', 'destination address')
 
-const memCache = new Map(); // key: origin||'__'||destination -> { minutes, distance_km, ts }
+const memCache = new Map(); // key: origin||'__'||destination -> { minutes, distance_km, distance_mi, approximate, ts }
+const KM_TO_MI = 0.621371;
 const TTL = 1000 * 60 * 30; // 30 min
 
 export async function getDrivingTimeMinutes(origin, destination) {
@@ -33,7 +34,8 @@ export async function getDrivingTimeMinutes(origin, destination) {
   }
   const data = await res.json();
   if (data.minutes == null) return null;
-  memCache.set(key, { minutes: data.minutes, distance_km: data.distance_km, ts: now });
+  const distance_mi = data.distance_km != null ? Number((data.distance_km * KM_TO_MI).toFixed(2)) : null;
+  memCache.set(key, { minutes: data.minutes, distance_km: data.distance_km, distance_mi, approximate: !!data.approximate, ts: now });
   return data.minutes;
 }
 
@@ -51,7 +53,8 @@ export async function prefetchDrivingTimes(homeBase, addresses) {
   (data.results||[]).forEach(r => {
     if (r.minutes != null) {
       const key = homeBase + '||' + r.address;
-      memCache.set(key, { minutes: r.minutes, distance_km: r.distance_km, ts: now });
+  const distance_mi = r.distance_km != null ? Number((r.distance_km * KM_TO_MI).toFixed(2)) : null;
+  memCache.set(key, { minutes: r.minutes, distance_km: r.distance_km, distance_mi, approximate: !!r.approximate, ts: now });
     }
   });
   return data.results || [];
@@ -62,4 +65,17 @@ export function getCachedDistanceKm(origin, destination) {
   const key = origin + '||' + destination;
   const rec = memCache.get(key);
   return rec?.distance_km ?? null;
+}
+
+export function getCachedDistanceMi(origin, destination) {
+  const key = origin + '||' + destination;
+  const rec = memCache.get(key);
+  return rec?.distance_mi ?? null;
+}
+
+export function getCachedTravel(origin, destination) {
+  const key = origin + '||' + destination;
+  const rec = memCache.get(key);
+  if (!rec) return null;
+  return { minutes: rec.minutes, distance_km: rec.distance_km, distance_mi: rec.distance_mi, approximate: !!rec.approximate };
 }

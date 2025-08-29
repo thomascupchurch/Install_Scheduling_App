@@ -334,57 +334,62 @@ app.post('/api/schedules', async (req, res) => {
       const slices = [];
       if (!installerIds?.length || !totalManHours) return slices;
       const nInstallers = installerIds.length;
-      const perClockTotal = Number(totalManHours) / nInstallers; // elapsed clock hours total per installer
-      if (coreOverrideFlag || override) {
-        // single slice using provided start datetime
-        slices.push({ start: startISO, hours: perClockTotal });
-        return slices;
-      }
-      // Load core hours & holidays
+      const perClockTotal = Number(totalManHours) / nInstallers; // elapsed work (not including travel) hours per installer
+      // Load core hours & holidays & drive settings
       const coreStartRow = await db.get('SELECT value FROM settings WHERE key=?',[ 'core_start_hour' ]);
       const coreEndRow = await db.get('SELECT value FROM settings WHERE key=?',[ 'core_end_hour' ]);
+      const driveOutRow = await db.get('SELECT value FROM settings WHERE key=?',[ 'drive_out_minutes' ]);
+      const driveReturnRow = await db.get('SELECT value FROM settings WHERE key=?',[ 'drive_return_minutes' ]);
+      const driveOut = Number(driveOutRow?.value || 0);
+      const driveBack = Number(driveReturnRow?.value || 0);
       const coreStart = Number(coreStartRow?.value || 8);
       const coreEnd = Number(coreEndRow?.value || 16);
+      const coreSpan = coreEnd - coreStart;
       const holidaysRow = await db.get('SELECT value FROM settings WHERE key=?',['holidays']);
       let holidays = [];
       if (holidaysRow?.value) { try { holidays = JSON.parse(holidaysRow.value); } catch { holidays = []; } }
+      if (!coreOverrideFlag && !override) {
+        // Validate that at least some working time remains each day
+        if (coreSpan - (driveOut/60) - (driveBack/60) <= 0) {
+          throw new Error('No working time available inside core hours after reserving drive time. Adjust drive or core settings.');
+        }
+      }
+      if (coreOverrideFlag || override) {
+        // Travel can extend outside core hours; just single slice
+        slices.push({ start: startISO, hours: perClockTotal });
+        return slices;
+      }
       let remaining = perClockTotal;
       let idx = 0;
       let cursor = new Date(startISO);
       if (isNaN(cursor.getTime())) cursor = new Date();
-      // Align first day start hour inside core window if earlier
+      // Align start to core start if earlier
       if (cursor.getHours() < coreStart) cursor.setHours(coreStart,0,0,0);
       while (remaining > 0 && idx < 100) {
         const dayKey = cursor.toISOString().slice(0,10);
         const isWeekend = cursor.getDay()===0 || cursor.getDay()===6 || holidays.includes(dayKey);
-        let windowStart = new Date(cursor);
-        // For subsequent days ensure we reset to core start (or 00:00 weekend) instead of carrying prior time
-        if (idx > 0) {
-          windowStart = new Date(cursor);
-          if (isWeekend) {
-            windowStart.setHours(0,0,0,0);
-          } else {
-            windowStart.setHours(coreStart,0,0,0);
-          }
+        // Weekend work without override should have been shifted earlier; if still encountered, skip day
+        if (isWeekend) { cursor.setDate(cursor.getDate()+1); cursor.setHours(coreStart,0,0,0); idx++; continue; }
+        const dayStart = new Date(cursor); dayStart.setHours(coreStart,0,0,0);
+        const dayEnd = new Date(cursor); dayEnd.setHours(coreEnd,0,0,0);
+        // Reserve travel inside core hours
+        const workStart = new Date(dayStart.getTime() + driveOut*60000);
+        const workEndCap = new Date(dayEnd.getTime() - driveBack*60000);
+        if (workEndCap <= workStart) { cursor.setDate(cursor.getDate()+1); cursor.setHours(coreStart,0,0,0); idx++; continue; }
+        // If first day and requested startISO is later than workStart, shift workStart forward (but keep travel within core)
+        if (idx === 0) {
+          const desired = new Date(startISO);
+            if (!isNaN(desired.getTime()) && desired > workStart && desired < workEndCap) {
+              // Ensure there is still room for return travel: end must allow driveBack to finish by coreEnd
+              workStart.setTime(desired.getTime());
+            }
         }
-        let windowEnd = new Date(windowStart);
-        if (isWeekend) {
-          windowEnd.setDate(windowEnd.getDate()+1); // full 24h
-        } else {
-          windowEnd.setHours(coreEnd,0,0,0);
-        }
-        const available = (windowEnd - windowStart)/3600000;
-        if (available <= 0) {
-          // advance a day
-          cursor = new Date(cursor.getTime() + 24*3600000);
-          idx++; continue;
-        }
-        const sliceHours = Math.min(remaining, available);
-        slices.push({ start: windowStart.toISOString(), hours: sliceHours });
+        const workCapHours = (workEndCap - workStart)/3600000;
+        if (workCapHours <= 0) { cursor.setDate(cursor.getDate()+1); cursor.setHours(coreStart,0,0,0); idx++; continue; }
+        const sliceHours = Math.min(remaining, workCapHours);
+        slices.push({ start: workStart.toISOString(), hours: sliceHours });
         remaining -= sliceHours;
-        // advance cursor to next day 00:00 for further slicing
-        cursor = new Date(windowStart);
-        cursor.setDate(cursor.getDate()+1);
+        cursor = new Date(dayStart); cursor.setDate(cursor.getDate()+1); cursor.setHours(coreStart,0,0,0);
         idx++;
       }
       return slices;
@@ -443,6 +448,9 @@ app.post('/api/schedules', async (req, res) => {
     }
   res.json({ id: schedule_id, job_number, title, date, start_time, end_time, description, installers, man_hours, core_hours_override: !!core_hours_override, override_hours: !!override, override_availability: !!override_availability, shiftedWeekend, shiftedHoliday, original_date: (shiftedWeekend||shiftedHoliday) ? original_date : undefined, rule_overrides });
   } catch (e) {
+    if (e && /UNIQUE constraint failed: schedules\.job_number/.test(e.message || '')) {
+      return res.status(409).json({ error: 'Job number already exists. Choose a different Job # or edit the existing job.' });
+    }
     res.status(400).json({ error: e.message });
   }
 });
@@ -523,38 +531,43 @@ app.patch('/api/schedules/:id', async (req, res) => {
       if (!installerIds?.length || !totalManHours) return slices;
       const nInstallers = installerIds.length;
       const perClockTotal = Number(totalManHours) / nInstallers;
+      const coreStartRow = await db.get('SELECT value FROM settings WHERE key=?',[ 'core_start_hour' ]);
+      const coreEndRow = await db.get('SELECT value FROM settings WHERE key=?',[ 'core_end_hour' ]);
+      const driveOutRow = await db.get('SELECT value FROM settings WHERE key=?',[ 'drive_out_minutes' ]);
+      const driveReturnRow = await db.get('SELECT value FROM settings WHERE key=?',[ 'drive_return_minutes' ]);
+      const driveOut = Number(driveOutRow?.value || 0);
+      const driveBack = Number(driveReturnRow?.value || 0);
+      const coreStart = Number(coreStartRow?.value || 8);
+      const coreEnd = Number(coreEndRow?.value || 16);
+      const coreSpan = coreEnd - coreStart;
+      const holidaysRow = await db.get('SELECT value FROM settings WHERE key=?',['holidays']);
+      let holidays = [];
+      if (holidaysRow?.value) { try { holidays = JSON.parse(holidaysRow.value); } catch { holidays = []; } }
+      if (!coreOverrideFlag && !override) {
+        if (coreSpan - (driveOut/60) - (driveBack/60) <= 0) throw new Error('No working time after reserving drive time. Adjust settings.');
+      }
       if (coreOverrideFlag || override) {
         slices.push({ start: startISO, hours: perClockTotal });
         return slices;
       }
-      const coreStartRow = await db.get('SELECT value FROM settings WHERE key=?',[ 'core_start_hour' ]);
-      const coreEndRow = await db.get('SELECT value FROM settings WHERE key=?',[ 'core_end_hour' ]);
-      const coreStart = Number(coreStartRow?.value || 8);
-      const coreEnd = Number(coreEndRow?.value || 16);
-      const holidaysRow = await db.get('SELECT value FROM settings WHERE key=?',['holidays']);
-      let holidays = [];
-      if (holidaysRow?.value) { try { holidays = JSON.parse(holidaysRow.value); } catch { holidays = []; } }
       let remaining = perClockTotal;
-      let idx = 0;
-      let cursor = new Date(startISO);
-      if (isNaN(cursor.getTime())) cursor = new Date();
-      if (cursor.getHours() < coreStart) cursor.setHours(coreStart,0,0,0);
+      let idx = 0; let cursor = new Date(startISO); if (isNaN(cursor.getTime())) cursor = new Date(); if (cursor.getHours() < coreStart) cursor.setHours(coreStart,0,0,0);
       while (remaining > 0 && idx < 100) {
         const dayKey = cursor.toISOString().slice(0,10);
         const isWeekend = cursor.getDay()===0 || cursor.getDay()===6 || holidays.includes(dayKey);
-        let windowStart = new Date(cursor);
-        if (idx > 0) {
-          windowStart = new Date(cursor);
-          if (isWeekend) windowStart.setHours(0,0,0,0); else windowStart.setHours(coreStart,0,0,0);
+        if (isWeekend) { cursor.setDate(cursor.getDate()+1); cursor.setHours(coreStart,0,0,0); idx++; continue; }
+        const dayStart = new Date(cursor); dayStart.setHours(coreStart,0,0,0);
+        const dayEnd = new Date(cursor); dayEnd.setHours(coreEnd,0,0,0);
+        const workStart = new Date(dayStart.getTime() + driveOut*60000);
+        const workEndCap = new Date(dayEnd.getTime() - driveBack*60000);
+        if (workEndCap <= workStart) { cursor.setDate(cursor.getDate()+1); cursor.setHours(coreStart,0,0,0); idx++; continue; }
+        if (idx === 0) {
+          const desired = new Date(startISO); if (!isNaN(desired.getTime()) && desired > workStart && desired < workEndCap) workStart.setTime(desired.getTime());
         }
-        let windowEnd = new Date(windowStart);
-        if (isWeekend) windowEnd.setDate(windowEnd.getDate()+1); else windowEnd.setHours(coreEnd,0,0,0);
-        const available = (windowEnd - windowStart)/3600000;
-        if (available <= 0) { cursor = new Date(cursor.getTime()+24*3600000); idx++; continue; }
-        const sliceHours = Math.min(remaining, available);
-        slices.push({ start: windowStart.toISOString(), hours: sliceHours });
-        remaining -= sliceHours;
-        cursor = new Date(windowStart); cursor.setDate(cursor.getDate()+1); idx++;
+        const workCapHours = (workEndCap - workStart)/3600000; if (workCapHours <= 0) { cursor.setDate(cursor.getDate()+1); cursor.setHours(coreStart,0,0,0); idx++; continue; }
+        const sliceHours = Math.min(remaining, workCapHours);
+        slices.push({ start: workStart.toISOString(), hours: sliceHours });
+        remaining -= sliceHours; cursor = new Date(dayStart); cursor.setDate(cursor.getDate()+1); cursor.setHours(coreStart,0,0,0); idx++;
       }
       return slices;
     }
@@ -630,6 +643,9 @@ app.patch('/api/schedules/:id', async (req, res) => {
     updated.installers = updatedInstallers.map(i => i.installer_id);
   res.json({ ...updated, shiftedWeekend, shiftedHoliday, original_date: (shiftedWeekend||shiftedHoliday) ? original_date : undefined, rule_overrides });
   } catch (e) {
+    if (e && /UNIQUE constraint failed: schedules\.job_number/.test(e.message || '')) {
+      return res.status(409).json({ error: 'Job number already exists. Use a different Job #.' });
+    }
     res.status(400).json({ error: e.message });
   }
 });
@@ -700,6 +716,7 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   const jobs = XLSX.utils.sheet_to_json(sheet);
   let imported = 0;
+  let duplicates = 0;
   for (const job of jobs) {
     // Map spreadsheet fields to DB fields
     const job_number = job['Job'] || job['Job Number'] || '';
@@ -721,14 +738,14 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
     const address = addressParts.filter(Boolean).join(', ');
     if (!job_number || !title || !date) continue;
     try {
-      await db.run(
+      const result = await db.run(
         'INSERT OR IGNORE INTO schedules (job_number, title, date, description, man_hours, address) VALUES (?, ?, ?, ?, ?, ?)',
         [job_number, title, date, description, man_hours, address]
       );
-      imported++;
+      if (result.changes === 0) duplicates++; else imported++;
     } catch {}
   }
-  res.json({ imported });
+  res.json({ imported, duplicates });
 });
 
 app.listen(port, () => {
@@ -844,6 +861,8 @@ app.post('/api/send-calendar-updates', async (req, res) => {
 // Utility: geocode with caching
 async function geocodeAddressCached(address) {
   if (!address) throw new Error('Missing address');
+  const original = address;
+  address = address.replace(/\s+/g,' ').trim();
   const cached = await db.get('SELECT lon, lat FROM geocode_cache WHERE address = ?', [address]);
   if (cached) return [cached.lon, cached.lat];
   if (!ORS_API_KEY || ORS_API_KEY === 'REPLACE_ME') throw new Error('ORS API key not configured');
@@ -852,9 +871,13 @@ async function geocodeAddressCached(address) {
   if (!resp.ok) throw new Error('Geocoding failed');
   const data = await resp.json();
   const feat = data.features && data.features[0];
-  if (!feat) throw new Error('No geocode result');
+  if (!feat) {
+    console.warn('[geocode] no result for', original, 'normalized as', address);
+    throw new Error('No geocode result');
+  }
   const [lon, lat] = feat.geometry.coordinates;
   await db.run('INSERT OR REPLACE INTO geocode_cache (address, lon, lat, fetched_at) VALUES (?,?,?,?)', [address, lon, lat, new Date().toISOString()]);
+  console.log(`[geocode] ${address} -> (${lon},${lat})`);
   return [lon, lat];
 }
 
@@ -863,30 +886,115 @@ app.post('/api/driving-time', async (req, res) => {
   try {
     const { origin, destination, force } = req.body || {};
     if (!origin || !destination) return res.status(400).json({ error: 'origin and destination required' });
-    // Check cache
-  let cached = !force && await db.get('SELECT minutes, distance FROM drive_time_cache WHERE origin = ? AND destination = ?', [origin, destination]);
-    // Bidirectional reuse (assume symmetry) if direct not found
-    if (!cached && !force) {
-  const reverse = await db.get('SELECT minutes, distance FROM drive_time_cache WHERE origin = ? AND destination = ?', [destination, origin]);
-      if (reverse) cached = reverse; // treat as same
+    function clean(addr){
+      return addr
+        .replace(/Ste\.?(\s+\w+)?/ig,'')
+        .replace(/Suite\s+\w+/ig,'')
+        .replace(/#\s*\w+/g,'')
+        .replace(/\s+/g,' ')
+        .replace(/\.$/,'')
+        .trim();
     }
-  if (cached) return res.json({ origin, destination, minutes: cached.minutes, distance_km: cached.distance, cached: true });
-    const [oLon, oLat] = await geocodeAddressCached(origin);
-    const [dLon, dLat] = await geocodeAddressCached(destination);
+    let originUse = origin;
+    let destUse = destination;
+    let cached = !force && await db.get('SELECT minutes, distance FROM drive_time_cache WHERE origin = ? AND destination = ?', [originUse, destUse]);
+    if (!cached && !force) {
+      const reverse = await db.get('SELECT minutes, distance FROM drive_time_cache WHERE origin = ? AND destination = ?', [destUse, originUse]);
+      if (reverse) cached = reverse;
+    }
+    if (cached) return res.json({ origin: originUse, destination: destUse, minutes: cached.minutes, distance_km: cached.distance, cached: true });
+    console.log(`[drive-time] fetching fresh route ${originUse} -> ${destUse}`);
+    let [oLon, oLat] = await geocodeAddressCached(originUse);
+    let [dLon, dLat] = await geocodeAddressCached(destUse);
     if (!ORS_API_KEY || ORS_API_KEY === 'REPLACE_ME') return res.status(400).json({ error: 'ORS API key not configured' });
-    const url = `https://api.openrouteservice.org/v2/directions/driving-car?api_key=${ORS_API_KEY}&start=${oLon},${oLat}&end=${dLon},${dLat}`;
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error('Routing failed');
-    const json = await resp.json();
-  const summary = json?.routes?.[0]?.summary;
-  const seconds = summary?.duration;
-  const meters = summary?.distance;
-  if (!seconds) throw new Error('No route found');
-  const minutes = Math.round(seconds / 60);
-  const distanceKm = meters != null ? Number((meters / 1000).toFixed(2)) : null;
-  await db.run('INSERT OR REPLACE INTO drive_time_cache (origin, destination, minutes, distance, fetched_at) VALUES (?,?,?,?,?)', [origin, destination, minutes, distanceKm, new Date().toISOString()]);
-  res.json({ origin, destination, minutes, distance_km: distanceKm, cached: false });
+    async function fetchRoute(aLon,aLat,bLon,bLat,label){
+      const url = `https://api.openrouteservice.org/v2/directions/driving-car?api_key=${ORS_API_KEY}&start=${aLon},${aLat}&end=${bLon},${bLat}`;
+      const resp = await fetch(url);
+      if (!resp.ok) {
+        const bodyTxt = await resp.text();
+        throw new Error(`Routing failed (${label}) ${resp.status}: ${bodyTxt.slice(0,120)}`);
+      }
+      return resp.json();
+    }
+    let json = await fetchRoute(oLon,oLat,dLon,dLat,'original');
+        function extractSummary(obj){
+          if (!obj || typeof obj !== 'object') return null;
+          if (obj.routes && obj.routes[0] && obj.routes[0].summary) return obj.routes[0].summary; // non-geojson variant
+          if (obj.features && obj.features[0] && obj.features[0].properties) {
+            const p = obj.features[0].properties;
+            if (p.summary) return p.summary;
+            // Some ORS responses only include segments (array) with distance/duration
+            if (Array.isArray(p.segments) && p.segments[0] && (p.segments[0].distance!=null || p.segments[0].duration!=null)) {
+              const dist = p.segments.reduce((acc,s)=>acc + (s.distance||0),0);
+                const dur = p.segments.reduce((acc,s)=>acc + (s.duration||0),0);
+              return { distance: dist, duration: dur };
+            }
+          }
+          return null;
+        }
+        let summary = extractSummary(json);
+        let seconds = summary?.duration;
+        let meters = summary?.distance;
+    if (!seconds) {
+      console.warn('[drive-time] missing summary on GET result (original) snippet:', JSON.stringify(json).slice(0,200));
+      const cleanedOrigin = clean(originUse);
+      const cleanedDest = clean(destUse);
+      if (cleanedOrigin !== originUse || cleanedDest !== destUse) {
+        console.log('[drive-time] retry cleaned', cleanedOrigin, '->', cleanedDest);
+        originUse = cleanedOrigin; destUse = cleanedDest;
+        ;[oLon,oLat] = await geocodeAddressCached(originUse);
+        ;[dLon,dLat] = await geocodeAddressCached(destUse);
+        json = await fetchRoute(oLon,oLat,dLon,dLat,'cleaned');
+        summary = extractSummary(json);
+        seconds = summary?.duration;
+        meters = summary?.distance;
+      }
+      if (!seconds) {
+        console.warn('[drive-time] still missing summary after cleaned GET attempts; trying POST fallback');
+        // POST fallback per ORS docs
+        try {
+          const postResp = await fetch('https://api.openrouteservice.org/v2/directions/driving-car', {
+            method: 'POST',
+            headers: { 'Authorization': ORS_API_KEY, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ coordinates: [[oLon,oLat],[dLon,dLat]] })
+          });
+          if (postResp.ok) {
+            const postJson = await postResp.json();
+            summary = extractSummary(postJson);
+            seconds = summary?.duration;
+            meters = summary?.distance;
+            if (!seconds) console.warn('[drive-time] POST fallback also lacked summary snippet:', JSON.stringify(postJson).slice(0,200));
+          } else {
+            const txt = await postResp.text();
+            console.warn('[drive-time] POST fallback HTTP error', postResp.status, txt.slice(0,160));
+          }
+        } catch (err) {
+          console.warn('[drive-time] POST fallback exception', err.message);
+        }
+        if (!seconds) {
+          // Haversine approximate fallback so UI can still show something
+          const R = 6371; // km
+          const toRad = d => d * Math.PI/180;
+          const dLatRad = toRad(dLat - oLat);
+          const dLonRad = toRad(dLon - oLon);
+          const a = Math.sin(dLatRad/2)**2 + Math.cos(toRad(oLat))*Math.cos(toRad(dLat))*Math.sin(dLonRad/2)**2;
+          const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+          const straightKm = +(R * c).toFixed(2);
+          // assume avg speed 65 km/h (rough urban/suburban blend)
+          const minutesApprox = Math.max(5, Math.round((straightKm / 65) * 60));
+          console.warn('[drive-time] no route after all attempts, returning approximate haversine', straightKm,'km', minutesApprox,'min');
+          await db.run('INSERT OR REPLACE INTO drive_time_cache (origin, destination, minutes, distance, fetched_at) VALUES (?,?,?,?,?)', [originUse, destUse, minutesApprox, straightKm, new Date().toISOString()]);
+          return res.json({ origin: originUse, destination: destUse, minutes: minutesApprox, distance_km: straightKm, cached: false, approximate: true });
+        }
+      }
+    }
+    const minutes = Math.round(seconds / 60);
+    const distanceKm = meters != null ? Number((meters/1000).toFixed(2)) : null;
+    await db.run('INSERT OR REPLACE INTO drive_time_cache (origin, destination, minutes, distance, fetched_at) VALUES (?,?,?,?,?)', [originUse, destUse, minutes, distanceKm, new Date().toISOString()]);
+    console.log(`[drive-time] stored ${originUse} -> ${destUse}: ${minutes}m, ${distanceKm}km`);
+    res.json({ origin: originUse, destination: destUse, minutes, distance_km: distanceKm, cached: false });
   } catch (e) {
+    console.error('[drive-time] error', e.message);
     res.status(400).json({ error: e.message });
   }
 });
@@ -899,34 +1007,74 @@ app.post('/api/driving-time/prefetch', async (req, res) => {
     if (!homeBase || !Array.isArray(addresses)) return res.status(400).json({ error: 'homeBase and addresses[] required' });
     const unique = [...new Set(addresses.filter(a => !!a && a.trim().length))];
     const results = [];
-    for (const addr of unique) {
+    const clean = a => a.replace(/Ste\.?(\s+\w+)?/ig,'').replace(/Suite\s+\w+/ig,'').replace(/#\s*\w+/g,'').replace(/\s+/g,' ').replace(/\.$/,'').trim();
+    function extractSummary(obj){
+      if (!obj || typeof obj !== 'object') return null;
+      if (obj.routes && obj.routes[0] && obj.routes[0].summary) return obj.routes[0].summary;
+      if (obj.features && obj.features[0] && obj.features[0].properties){
+        const p = obj.features[0].properties;
+        if (p.summary) return p.summary;
+        if (Array.isArray(p.segments) && p.segments[0]){
+          const dist = p.segments.reduce((acc,s)=>acc + (s.distance||0),0);
+          const dur = p.segments.reduce((acc,s)=>acc + (s.duration||0),0);
+          return { distance: dist, duration: dur };
+        }
+      }
+      return null;
+    }
+    for (const addrOrig of unique) {
+      let addr = addrOrig;
       try {
-  let cached = !force && await db.get('SELECT minutes, distance FROM drive_time_cache WHERE origin = ? AND destination = ?', [homeBase, addr]);
+        let cached = !force && await db.get('SELECT minutes, distance FROM drive_time_cache WHERE origin = ? AND destination = ?', [homeBase, addr]);
         if (!cached && !force) {
           const reverse = await db.get('SELECT minutes, distance FROM drive_time_cache WHERE origin = ? AND destination = ?', [addr, homeBase]);
           if (reverse) cached = reverse;
         }
-        if (cached) {
-          results.push({ address: addr, minutes: cached.minutes, distance_km: cached.distance, cached: true });
+        if (cached) { results.push({ address: addrOrig, minutes: cached.minutes, distance_km: cached.distance, cached: true }); continue; }
+        console.log(`[drive-time][prefetch] fetching ${homeBase} -> ${addr}`);
+        let [oLon,oLat] = await geocodeAddressCached(homeBase);
+        let [dLon,dLat] = await geocodeAddressCached(addr);
+        if (!ORS_API_KEY || ORS_API_KEY === 'REPLACE_ME') throw new Error('ORS API key not configured');
+        const baseUrl = `https://api.openrouteservice.org/v2/directions/driving-car?api_key=${ORS_API_KEY}&start=${oLon},${oLat}&end=${dLon},${dLat}`;
+        let resp = await fetch(baseUrl);
+        if (resp.status === 429) { await new Promise(r=>setTimeout(r,500)); resp = await fetch(baseUrl); }
+        if (!resp.ok) throw new Error('Routing failed');
+        let json = await resp.json();
+        let summary = extractSummary(json);
+        let seconds = summary?.duration; let meters = summary?.distance;
+        if (!seconds) {
+          const cleaned = clean(addr);
+          if (cleaned !== addr) {
+            addr = cleaned; console.log('[drive-time][prefetch] retry cleaned', addrOrig,'->', addr);
+            [dLon,dLat] = await geocodeAddressCached(addr);
+            const retryUrl = `https://api.openrouteservice.org/v2/directions/driving-car?api_key=${ORS_API_KEY}&start=${oLon},${oLat}&end=${dLon},${dLat}`;
+            let r2 = await fetch(retryUrl); if (r2.status===429){ await new Promise(r=>setTimeout(r,500)); r2 = await fetch(retryUrl);} 
+            if (r2.ok){
+              json = await r2.json(); summary = extractSummary(json); seconds = summary?.duration; meters = summary?.distance;
+            }
+          }
+        }
+        if (!seconds) {
+          // POST fallback
+          try {
+            let postResp = await fetch('https://api.openrouteservice.org/v2/directions/driving-car', { method:'POST', headers:{Authorization: ORS_API_KEY, 'Content-Type':'application/json'}, body: JSON.stringify({ coordinates:[[oLon,oLat],[dLon,dLat]] }) });
+            if (postResp.status===429){ await new Promise(r=>setTimeout(r,800)); postResp = await fetch('https://api.openrouteservice.org/v2/directions/driving-car', { method:'POST', headers:{Authorization: ORS_API_KEY, 'Content-Type':'application/json'}, body: JSON.stringify({ coordinates:[[oLon,oLat],[dLon,dLat]] }) }); }
+            if (postResp.ok){ const pj = await postResp.json(); summary = extractSummary(pj); seconds = summary?.duration; meters = summary?.distance; }
+          } catch(_){}
+        }
+        if (!seconds) {
+          const R=6371,toRad=d=>d*Math.PI/180; const dLatRad=toRad(dLat-oLat), dLonRad=toRad(dLon-oLon); const a=Math.sin(dLatRad/2)**2 + Math.cos(toRad(oLat))*Math.cos(toRad(dLat))*Math.sin(dLonRad/2)**2; const c=2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a)); const straightKm=+(R*c).toFixed(2); const minutesApprox=Math.max(5,Math.round((straightKm/65)*60));
+          await db.run('INSERT OR REPLACE INTO drive_time_cache (origin, destination, minutes, distance, fetched_at) VALUES (?,?,?,?,?)', [homeBase, addr, minutesApprox, straightKm, new Date().toISOString()]);
+          results.push({ address: addrOrig, minutes: minutesApprox, distance_km: straightKm, cached:false, approximate:true });
           continue;
         }
-        const [oLon, oLat] = await geocodeAddressCached(homeBase);
-        const [dLon, dLat] = await geocodeAddressCached(addr);
-        if (!ORS_API_KEY || ORS_API_KEY === 'REPLACE_ME') throw new Error('ORS API key not configured');
-        const url = `https://api.openrouteservice.org/v2/directions/driving-car?api_key=${ORS_API_KEY}&start=${oLon},${oLat}&end=${dLon},${dLat}`;
-        const resp = await fetch(url);
-        if (!resp.ok) throw new Error('Routing failed');
-        const json = await resp.json();
-  const summary = json?.routes?.[0]?.summary;
-  const seconds = summary?.duration;
-  const meters = summary?.distance;
-  if (!seconds) throw new Error('No route');
-  const minutes = Math.round(seconds / 60);
-  const distanceKm = meters != null ? Number((meters/1000).toFixed(2)) : null;
-  await db.run('INSERT OR REPLACE INTO drive_time_cache (origin, destination, minutes, distance, fetched_at) VALUES (?,?,?,?,?)', [homeBase, addr, minutes, distanceKm, new Date().toISOString()]);
-  results.push({ address: addr, minutes, distance_km: distanceKm, cached: false });
+        const minutes = Math.round(seconds/60); const distanceKm = meters!=null?Number((meters/1000).toFixed(2)):null;
+        await db.run('INSERT OR REPLACE INTO drive_time_cache (origin, destination, minutes, distance, fetched_at) VALUES (?,?,?,?,?)', [homeBase, addr, minutes, distanceKm, new Date().toISOString()]);
+        console.log(`[drive-time][prefetch] stored ${homeBase} -> ${addr}: ${minutes}m, ${distanceKm}km`);
+        results.push({ address: addrOrig, minutes, distance_km: distanceKm, cached:false });
       } catch (inner) {
-        results.push({ address: addr, error: inner.message });
+        console.error('[drive-time][prefetch] error', addrOrig, inner.message);
+        results.push({ address: addrOrig, error: inner.message });
       }
     }
     res.json({ homeBase, count: results.length, results });

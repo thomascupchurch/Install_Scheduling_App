@@ -4,7 +4,7 @@ import withDragAndDrop from 'react-big-calendar/lib/addons/dragAndDrop';
 import 'react-big-calendar/lib/addons/dragAndDrop/styles.css';
 import 'react-big-calendar/lib/css/react-big-calendar.css';
 import { format, parse, startOfWeek, getDay } from 'date-fns';
-import { getDrivingTimeMinutes, prefetchDrivingTimes, getCachedDistanceKm } from './drivingTime';
+import { getDrivingTimeMinutes, prefetchDrivingTimes, getCachedDistanceKm, getCachedTravel, getCachedDistanceMi } from './drivingTime';
 
 const locales = { 'en-US': require('date-fns/locale/en-US') };
 const localizer = dateFnsLocalizer({ format, parse, startOfWeek: () => startOfWeek(new Date(), { weekStartsOn: 0 }), getDay, locales });
@@ -54,6 +54,7 @@ async function buildEvents(job, homeBase, settings) {
   let driveMinutesOut = 0; let travelDistanceKm = null; let driveMinutesReturn = 0;
   if (homeBase && job.address) {
     try { driveMinutesOut = await getDrivingTimeMinutes(homeBase, job.address); } catch { driveMinutesOut = 0; }
+    if (driveMinutesOut == null || isNaN(driveMinutesOut)) driveMinutesOut = 0;
     try { travelDistanceKm = getCachedDistanceKm(homeBase, job.address); } catch { travelDistanceKm = null; }
     driveMinutesReturn = driveMinutesOut;
   }
@@ -65,7 +66,11 @@ async function buildEvents(job, homeBase, settings) {
   if (job.core_hours_override && !backendSlices) {
     const start = new Date(baseStart.getTime() + driveMinutesOut*60000);
     const end = new Date(start.getTime() + clockHoursTotal*3600000);
-    return [{ id: `${job.id}-0`, title: job.description || job.job_number, start, end, jobLabel: `${job.job_number || ''} ${job.description || ''}`.trim(), manHours: totalManHours, color: colorForJob(job), partIndex:1, partsTotal:1, partHours: clockHoursTotal, remainingHours:0, clockHoursTotal, resource: job, travelDistanceKm, travelOutMinutes: driveMinutesOut, travelReturnMinutes: driveMinutesReturn }];
+  const main = { id: `${job.id}-0`, title: job.description || job.job_number, start, end, jobLabel: `${job.job_number || ''} ${job.description || ''}`.trim(), manHours: totalManHours, color: colorForJob(job), partIndex:1, partsTotal:1, partHours: clockHoursTotal, remainingHours:0, clockHoursTotal, resource: job, travelDistanceKm, travelOutMinutes: driveMinutesOut, travelReturnMinutes: driveMinutesReturn };
+  const travel = [];
+  if (driveMinutesOut > 0) travel.push({ id: `${job.id}-0-travel-out`, isTravel:true, title:`Drive Out (${driveMinutesOut}m)`, start: new Date(start.getTime() - driveMinutesOut*60000), end: start, resource: job, travelMinutes: driveMinutesOut });
+  if (driveMinutesReturn > 0) travel.push({ id: `${job.id}-0-travel-back`, isTravel:true, title:`Drive Back (${driveMinutesReturn}m)`, start: end, end: new Date(end.getTime() + driveMinutesReturn*60000), resource: job, travelMinutes: driveMinutesReturn });
+  return [...travel, main];
   }
   // Use backend slices if available
   if (backendSlices) {
@@ -98,13 +103,15 @@ async function buildEvents(job, homeBase, settings) {
         partsTotal: backendSlices.length,
         remainingHours: Number(remainingMan.toFixed(2))
       });
+      if (driveMinutesOut > 0) events.push({ id: `${job.id}-${idx}-travel-out`, isTravel:true, title:`Drive Out (${driveMinutesOut}m)`, start: new Date(start.getTime() - driveMinutesOut*60000), end: start, resource: job, travelMinutes: driveMinutesOut });
+      if (driveMinutesReturn > 0) events.push({ id: `${job.id}-${idx}-travel-back`, isTravel:true, title:`Drive Back (${driveMinutesReturn}m)`, start: end, end: new Date(end.getTime() + driveMinutesReturn*60000), resource: job, travelMinutes: driveMinutesReturn });
     });
     if (events.length === 1) {
       events[0].partIndex = 1; events[0].partsTotal = 1; events[0].remainingHours = 0;
     } else {
       events.forEach(ev => { ev.title = `${job.description || job.job_number} (Part ${ev.partIndex}/${ev.partsTotal})`; });
     }
-    return events;
+    return events.sort((a,b)=> a.start - b.start);
   }
   // fallback: legacy client slicing (should rarely happen now)
   // Split into multiple days inside core hours window, accounting for travel each day (both outbound + return).
@@ -157,7 +164,7 @@ async function buildEvents(job, homeBase, settings) {
   const cap = isWeekend ? availableHours : Math.min(availableHours, coreSpan());
   const hoursThisDay = Math.min(remaining, cap);
     const eventEnd = new Date(shiftedStart.getTime() + hoursThisDay * 3600000);
-    events.push({
+  events.push({
       id: `${job.id}-${dayIndex}`,
       // temporary title; will finalize with total parts after loop
       title: job.description || job.job_number,
@@ -174,6 +181,8 @@ async function buildEvents(job, homeBase, settings) {
   resource: job,
   nonCore: isWeekend
     });
+  if (driveMinutesOut > 0) events.push({ id: `${job.id}-${dayIndex}-travel-out`, isTravel:true, title:`Drive Out (${driveMinutesOut}m)`, start: new Date(shiftedStart.getTime() - driveMinutesOut*60000), end: shiftedStart, resource: job, travelMinutes: driveMinutesOut });
+  if (driveMinutesReturn > 0) events.push({ id: `${job.id}-${dayIndex}-travel-back`, isTravel:true, title:`Drive Back (${driveMinutesReturn}m)`, start: eventEnd, end: new Date(eventEnd.getTime() + driveMinutesReturn*60000), resource: job, travelMinutes: driveMinutesReturn });
     remaining -= hoursThisDay;
     dayIndex += 1;
   }
@@ -196,7 +205,7 @@ async function buildEvents(job, homeBase, settings) {
     events[0].partsTotal = 1;
     events[0].remainingHours = 0;
   }
-  return events;
+  return events.sort((a,b)=> a.start - b.start);
 }
 
 export default function CalendarView() {
@@ -312,15 +321,41 @@ export default function CalendarView() {
       if (!r.ok) throw new Error(`Schedules ${r.status}`);
       const jobs = await r.json();
       const arrays = await Promise.all(jobs.map(j => buildEvents(j, hb, schedSettings)));
-      setEvents(arrays.flat());
+      let built = arrays.flat();
       // Batch prefetch driving times for distinct addresses
       if (hb) {
         const addresses = jobs.map(j=>j.address).filter(a=>!!a);
         const unique = [...new Set(addresses)];
         if (unique.length) {
-          prefetchDrivingTimes(hb, unique).catch(()=>{});
+          prefetchDrivingTimes(hb, unique).then(()=>{
+            // After prefetch, update events and add travel bars if they were not created initially
+            setEvents(prev => {
+              const existingTravelIds = new Set(prev.filter(e=>e.isTravel).map(e=>e.id));
+              const next = [];
+              for (const ev of prev) {
+                if (ev.isTravel) { next.push(ev); continue; }
+                const addr = ev.resource?.address;
+                let updated = ev;
+                let t = null;
+                if (addr) t = getCachedTravel(hb, addr);
+                if (t) {
+                  updated = { ...ev, travelOutMinutes: t.minutes, travelReturnMinutes: t.minutes, travelDistanceKm: t.distance_km, travelDistanceMi: t.distance_mi, travelApproximate: t.approximate };
+                  // Add outbound/inbound travel events if not already present and minutes > 0
+                  if (t.minutes > 0 && !existingTravelIds.has(`${ev.id}-travel-out`)) {
+                    next.push({ id: `${ev.id}-travel-out`, isTravel:true, title:`Drive Out (${t.minutes}m)`, start: new Date(updated.start.getTime() - t.minutes*60000), end: updated.start, resource: ev.resource, travelMinutes: t.minutes });
+                  }
+                  if (t.minutes > 0 && !existingTravelIds.has(`${ev.id}-travel-back`)) {
+                    next.push({ id: `${ev.id}-travel-back`, isTravel:true, title:`Drive Back (${t.minutes}m)`, start: updated.end, end: new Date(updated.end.getTime() + t.minutes*60000), resource: ev.resource, travelMinutes: t.minutes });
+                  }
+                }
+                next.push(updated);
+              }
+              return next.sort((a,b)=> a.start - b.start);
+            });
+          }).catch(()=>{});
         }
       }
+      setEvents(built);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -376,7 +411,7 @@ export default function CalendarView() {
   useEffect(() => { if (homeBase !== undefined && schedSettings) loadSchedules(homeBase); }, [homeBase, schedSettings]);
   useEffect(()=>{ const { dragging, offsetX, offsetY, ...persist } = sidebarState; localStorage.setItem('sidebarState', JSON.stringify(persist)); }, [sidebarState]);
 
-  function handleSelectEvent(ev) { setSelected(ev.resource); }
+  function handleSelectEvent(ev) { if (ev.isTravel) return; setSelected(ev.resource); }
   function handleSelectSlot(slot) {
     const d = slot.start instanceof Date ? slot.start : new Date(slot.start);
     setForm(f => ({ ...f, date: d.toISOString().slice(0,16) }));
@@ -404,6 +439,7 @@ export default function CalendarView() {
     // Returns already-assigned "per-installer" hours (clock hours *not* total man-hours) for that day
     if (!dateStr) return 0;
     return events.filter(ev => {
+      if (ev.isTravel) return false;
       const evDay = getDayString(ev.start);
       return evDay === dateStr && Array.isArray(ev.resource?.installers) && ev.resource.installers.includes(installerId);
     }).reduce((sum, ev) => {
@@ -461,6 +497,7 @@ export default function CalendarView() {
     const perInstaller = Number(manHours)/(installerIds.length||1);
     const end = new Date(start.getTime() + perInstaller*3600000);
     return events.some(ev=>{
+      if (ev.isTravel) return false;
       if (excludeJobId && ev.resource?.id === excludeJobId) return false;
       if(!Array.isArray(ev.resource?.installers)) return false;
       if(!ev.resource.installers.some(id=>installerIds.includes(id))) return false;
@@ -529,6 +566,7 @@ export default function CalendarView() {
   const dailySummary = (() => {
     const map = {};
     events.forEach(ev => {
+      if (ev.isTravel) return; // ignore travel bars in summaries
       const day = ev.start.toISOString().slice(0,10);
       const job = ev.resource;
       if (!Array.isArray(job?.installers) || !ev.partHours) return;
@@ -862,7 +900,7 @@ export default function CalendarView() {
         onNavigate={(date)=> setCurrentDate(date)}
         views={['month','week','day']}
         style={{ height: 500 }}
-  draggableAccessor={() => true}
+  draggableAccessor={(event)=> !event.isTravel}
   min={currentView==='day'? dayMin: undefined}
   scrollToTime={currentView==='day'? scrollToSeven: undefined}
         resizable
@@ -870,6 +908,9 @@ export default function CalendarView() {
         onEventResize={resizeEvent}
         components={{
           event: ({ event }) => {
+            if (event.isTravel) {
+              return <span title={event.title} style={{ fontSize:10, display:'inline-block', width:'100%', textAlign:'center' }}>{event.title}</span>;
+            }
             const job = event.resource;
             const isEditing = inlineEdit.id === job.id;
             if (isEditing) {
@@ -927,15 +968,14 @@ export default function CalendarView() {
             const partsInfo = event.partsTotal > 1
               ? `Part ${event.partIndex}/${event.partsTotal} | Slice ${event.partHours} clock h | Remaining ${event.remainingHours} man-h of ${event.manHours} man-h (total clock ${event.clockHoursTotal}h)`
               : `${event.manHours} man-h (clock ${event.clockHoursTotal}h)`;
-      const travelInfo = (event.travelOutMinutes || event.travelReturnMinutes) ? `Travel Out: ${event.travelOutMinutes||0}m | Return: ${event.travelReturnMinutes||0}m` : '';
-      const distanceInfo = event.travelDistanceKm != null ? `Distance: ${event.travelDistanceKm} km` : '';
-      const tooltip = `${event.jobLabel} \n${partsInfo}${travelInfo?`\n${travelInfo}`:''}${distanceInfo?`\n${distanceInfo}`:''}`;
+            const distanceMi = event.travelDistanceMi != null ? event.travelDistanceMi : (event.travelDistanceKm != null ? Number((event.travelDistanceKm * 0.621371).toFixed(2)) : null);
+            const distanceInfo = distanceMi != null ? `Distance: ${distanceMi} mi` : '';
+            const travelLine = (event.travelOutMinutes || event.travelReturnMinutes) ? `Travel Out ${event.travelOutMinutes||0}m / Back ${event.travelReturnMinutes||0}m${event.travelApproximate?' (approx)':''}` : '';
+            const tooltip = `${event.jobLabel} \n${partsInfo}${travelLine?`\n${travelLine}`:''}${distanceInfo?`\n${distanceInfo}`:''}`;
             return (
               <span title={tooltip} style={{ position:'relative', paddingRight:14, display:'inline-block', maxWidth:'100%' }}>
                 {event.jobLabel}
-        {(travelInfo || distanceInfo) && <span style={{ display:'block', fontSize:9, opacity:0.85 }}>
-          {travelInfo}{travelInfo && distanceInfo ? ' | ' : ''}{distanceInfo}
-        </span>}
+                {distanceInfo && <span style={{ display:'block', fontSize:9, opacity:0.85 }}>{distanceInfo}</span>}
                 {(job.override_hours || job.override_availability || job.core_hours_override) && (
                   <span style={{ position:'absolute', left:2, top:2, display:'flex', gap:2 }}>
                     {job.override_hours ? <span style={{ background:'#ff9800', color:'#fff', fontSize:8, padding:'1px 3px', borderRadius:3 }} title="Daily hours/overlap override">H</span> : null}
@@ -955,7 +995,7 @@ export default function CalendarView() {
         }}
         eventPropGetter={(event) => {
           const style = {
-            backgroundColor: event.nonCore ? '#555' : (event.color || '#3174ad'),
+            backgroundColor: event.isTravel ? '#795548' : (event.nonCore ? '#555' : (event.color || '#3174ad')),
             border: event.nonCore ? '1px dashed #222' : '1px solid rgba(0,0,0,0.25)',
             color: '#fff',
             fontSize: 12,
@@ -964,6 +1004,7 @@ export default function CalendarView() {
             opacity: event.nonCore ? 0.8 : 0.95,
             boxShadow: event.nonCore ? 'inset 0 0 0 2px rgba(255,255,255,0.15)' : undefined
           };
+          if (event.isTravel) { style.fontSize = 10; style.border = '1px solid #4e342e'; }
           return { style };
         }}
         dayPropGetter={(date)=>{
