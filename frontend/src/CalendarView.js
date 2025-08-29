@@ -246,6 +246,76 @@ export default function CalendarView() {
   const [sendResults, setSendResults] = useState(null);
   const [health, setHealth] = useState({ orsConfigured: true, checked:false });
   const [driveWarn, setDriveWarn] = useState(null); // message string
+  const [pending, setPending] = useState([]);
+  const [pendingError, setPendingError] = useState(null);
+  const [pendingDrag, setPendingDrag] = useState(null); // { job, x, y }
+  const [scheduleNow, setScheduleNow] = useState(false);
+  const todayDateKey = (()=>{ const d=new Date(); d.setHours(0,0,0,0); return d.getTime(); })();
+  function isPastDate(dtLike) {
+    if (!dtLike) return false;
+    const d = dtLike instanceof Date ? new Date(dtLike) : new Date(dtLike);
+    if (isNaN(d.getTime())) return false;
+    d.setHours(0,0,0,0);
+    return d.getTime() < todayDateKey;
+  }
+
+  // Schedule a pending job (promote) helper
+  async function schedulePending(pendingJob, isoDate, manHours) {
+    if (isPastDate(isoDate)) { setToast({ message:'Cannot schedule into past date.', ts: Date.now() }); return; }
+    try {
+      const body = { date: isoDate, man_hours: manHours ? Number(manHours)||0 : 0 };
+      const res = await fetch(`/api/pending-jobs/${pendingJob.id}/schedule`, { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify(body) });
+      const data = await res.json().catch(()=>({}));
+      if (!res.ok) throw new Error(data.error || `Schedule failed (${res.status})`);
+      setToast({ message: `Scheduled ${pendingJob.job_number} on ${isoDate.slice(0,10)}`, ts: Date.now() });
+      await loadPending();
+      await loadSchedules();
+    } catch(e){ setToast({ message: e.message, ts: Date.now() }); }
+  }
+
+  // Handle global drag for pending jobs
+  React.useEffect(()=>{
+    if (!pendingDrag) return;
+    function onMove(e){
+      setPendingDrag(d=> d ? { ...d, x:e.clientX, y:e.clientY } : d);
+    }
+    async function onUp(e){
+      setPendingDrag(null);
+      const el = document.elementFromPoint(e.clientX, e.clientY);
+      if (!el) return;
+      // Traverse up to find a calendar cell
+      let node = el;
+      let dateStr = null;
+      for (let i=0;i<6 && node;i++){ // climb limited depth
+        if (node.getAttribute) {
+          if (node.getAttribute('data-date')) { dateStr = node.getAttribute('data-date'); break; }
+          if (node.classList && node.classList.contains('rbc-day-slot')) { // day/week view main column – use currentDate
+            dateStr = formatLocalDateTime(new Date(currentDate)).slice(0,10); break; }
+        }
+        node = node.parentNode;
+      }
+      if (!dateStr) return; // drop outside calendar – ignore
+      // Normalize to start of day 08:00 local (core start) unless override
+      const base = new Date(dateStr);
+      if (isNaN(base.getTime())) return;
+      base.setHours(CORE_START_HOUR || 8,0,0,0);
+      const iso = formatLocalDateTime(base);
+      // Ask man-hours
+      let mh = window.prompt(`Man-hours for ${pendingDrag?.job?.job_number || ''}? (blank=0)`, '');
+      if (mh === null) return; // cancelled
+      await schedulePending(pendingDrag.job, iso, mh);
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp, { once:true });
+    return ()=>{
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [pendingDrag, currentDate]);
+
+  async function loadPending(){
+    try { const r = await fetch('/api/pending-jobs'); if (!r.ok) throw new Error('pending '+r.status); const data = await r.json(); setPending(data); } catch(e){ setPendingError(e.message); }
+  }
 
   async function handleSendCalendar(e) {
     e.preventDefault();
@@ -408,15 +478,15 @@ export default function CalendarView() {
   const retryAll = () => { setError(null); loadInstallers(); loadHomeBase(); loadSchedules(); };
 
   useEffect(() => { loadInstallers(); loadHomeBase(); loadSettings(); }, []);
+  useEffect(()=>{ loadPending(); }, []);
   useEffect(() => { if (homeBase !== undefined && schedSettings) loadSchedules(homeBase); }, [homeBase, schedSettings]);
   useEffect(()=>{ const { dragging, offsetX, offsetY, ...persist } = sidebarState; localStorage.setItem('sidebarState', JSON.stringify(persist)); }, [sidebarState]);
 
   function handleSelectEvent(ev) { if (ev.isTravel) return; setSelected(ev.resource); }
   function handleSelectSlot(slot) {
     const d = slot.start instanceof Date ? slot.start : new Date(slot.start);
-    setForm(f => ({ ...f, date: d.toISOString().slice(0,16) }));
-  // Store as local wall time string (was using UTC toISOString causing hour jumps)
-  setForm(f => ({ ...f, date: formatLocalDateTime(d) }));
+    if (isPastDate(d)) { setToast({ message:'Past days are locked (view only).', ts: Date.now() }); return; }
+    setForm(f => ({ ...f, date: formatLocalDateTime(d) }));
     setShowForm(true);
   }
   function handleChange(e) {
@@ -533,29 +603,43 @@ export default function CalendarView() {
   const availabilityPartialConflict = availabilityConflict(form.date, form.man_hours, form.installers);
   async function submit(e) {
     e.preventDefault();
-  if (weekendBlocked || (isHoliday && !form.core_hours_override)) { return; }
-  if ((availabilityBlocked || availabilityPartialConflict) && !(overrideDailyLimit || overrideAvailability)) { setError('Selected installer is out (availability)'); return; }
-  if (overlapConflict && !overrideDailyLimit) { setError('Overlap with existing assignment (enable override)'); return; }
+    // Manual entry now stages as pending job; scheduling validations not required yet.
     try {
-  const payload = { ...form, title: form.description || form.job_number, override: overrideDailyLimit, override_availability: overrideAvailability };
-      const res = await fetch('/api/schedules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body.error || `Create failed (${res.status})`);
-      if (body.shiftedWeekend || body.shiftedHoliday) {
-        const kind = body.shiftedWeekend ? 'Weekend' : 'Holiday';
-        setToast({ message: `${kind} date auto-shifted to next business day (${body.original_date?.slice(0,10)} → ${body.date?.slice(0,10)})`, ts: Date.now() });
+      if (!form.job_number) throw new Error('Job number required');
+      if (!/^[A-Za-z0-9._-]+$/.test(form.job_number)) throw new Error('Job number must be alphanumeric (A-Z,0-9,.,_,-)');
+      const payload = {
+        job_number: form.job_number,
+        title: form.description || form.job_number,
+        description: form.description,
+        address: form.address,
+        man_hours: form.man_hours ? Number(form.man_hours) : null,
+        notes: form.man_hours ? `Planned man-hours: ${form.man_hours}` : undefined
+      };
+      const res = await fetch('/api/pending-jobs', { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify(payload) });
+      const body = await res.json().catch(()=>({}));
+      if (!res.ok) throw new Error(body.error || `Stage failed (${res.status})`);
+      if (scheduleNow) {
+        // Promote immediately using selected date (if provided) and man_hours
+        const dateISO = form.date ? form.date : null;
+        if (!dateISO) {
+          setToast({ message:'Staged (no date to schedule now).', ts: Date.now() });
+        } else {
+          try {
+            const schedRes = await fetch(`/api/pending-jobs/${body.id}/schedule`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ date: dateISO, man_hours: payload.man_hours }) });
+            const schedBody = await schedRes.json().catch(()=>({}));
+            if (!schedRes.ok) throw new Error(schedBody.error || `Schedule failed (${schedRes.status})`);
+            setToast({ message:`Created & scheduled ${body.job_number}`, ts: Date.now() });
+            await loadSchedules();
+          } catch(err2){ setToast({ message:`Staged only: ${err2.message}`, ts: Date.now() }); }
+        }
+      } else {
+        setToast({ message: `Staged ${body.job_number} as pending`, ts: Date.now() });
       }
-      if (Array.isArray(body.rule_overrides) && body.rule_overrides.length) {
-        setToast({ message: `Created with overrides: ${body.rule_overrides.join(', ')}`, ts: Date.now() });
-      }
-    } catch (e) {
-      setError(e.message);
-      return;
-    }
+      await loadPending();
+    } catch(err){ setError(err.message); return; }
     setShowForm(false);
-    setForm({ job_number: '', date: '', description: '', man_hours: '', installers: [], core_hours_override: false, address: '' });
-    setOverrideDailyLimit(false);
-    loadSchedules();
+    setForm({ job_number:'', date:'', description:'', man_hours:'', installers:[], core_hours_override:false, address:'' });
+    setScheduleNow(false);
   }
   function selectJobNumber(jobNo) {
     const found = events.find(e => e.resource && e.resource.job_number === jobNo);
@@ -627,7 +711,8 @@ export default function CalendarView() {
 
   // Inline edit helpers
   function startInlineEdit(job) {
-    setInlineEdit({ id: job.id, desc: job.description || '', mh: job.man_hours || '', installers: [...(job.installers||[])], loading: false, error: null });
+  if (isPastDate(job.date)) { setToast({ message:'Locked: cannot edit past job.', ts: Date.now() }); return; }
+  setInlineEdit({ id: job.id, desc: job.description || '', mh: job.man_hours || '', installers: [...(job.installers||[])], loading: false, error: null });
   }
   function cancelInlineEdit() { setInlineEdit({ id: null, desc: '', mh: '', installers: [], loading: false, error: null }); }
   function wouldExceedLimitEditing(job, newInstallerIds, dateStr, newManHours){
@@ -686,6 +771,8 @@ export default function CalendarView() {
   const DnDCalendar = withDragAndDrop(Calendar);
 
   async function moveEvent({ event, start, end }) {
+    if (isPastDate(event.start) || isPastDate(event.end)) { setToast({ message:'Locked: past jobs cannot be moved.', ts: Date.now() }); return; }
+    if (isPastDate(start)) { setToast({ message:'Cannot move into past date.', ts: Date.now() }); return; }
     // event.resource is the job; adjust its base date/time to new start (keep same time of day)
     const job = event.resource;
     if (!job) return;
@@ -770,6 +857,8 @@ export default function CalendarView() {
   }
 
   async function resizeEvent({ event, start, end }) {
+    if (isPastDate(event.start) || isPastDate(event.end)) { setToast({ message:'Locked: past jobs cannot be resized.', ts: Date.now() }); return; }
+    if (isPastDate(start) || isPastDate(end)) { setToast({ message:'Cannot resize into past.', ts: Date.now() }); return; }
     // Derive new per-installer hours from duration in hours (clamped >=0)
     const job = event.resource;
     if (!job) return;
@@ -803,7 +892,41 @@ export default function CalendarView() {
 
   return (
     <div style={{ height: 600, position: 'relative' }}>
-      {driveWarn && (
+      {/* Pending jobs rail */}
+      {pending.length > 0 && (
+        <div style={{ position:'absolute', left:0, top:0, bottom:0, width:180, background:'#f5f5f5', borderRight:'1px solid #ccc', overflowY:'auto', padding:'6px 6px 60px', zIndex:5 }}>
+          <div style={{ fontWeight:600, fontSize:13, marginBottom:6 }}>Pending Jobs</div>
+          {pending.map(p=> (
+            <div
+              key={p.id}
+              style={{ background:'#fff', border:'1px solid #bbb', borderRadius:6, padding:'6px 6px 8px', marginBottom:8, fontSize:11, cursor:'grab', boxShadow:'0 1px 3px rgba(0,0,0,0.15)', userSelect:'none' }}
+              title={p.job_number + '\n' + (p.building_name||'') }
+              onMouseDown={(e)=>{
+                if (e.button!==0) return;
+                setPendingDrag({ job:p, x:e.clientX, y:e.clientY, startX:e.clientX, startY:e.clientY });
+              }}
+              onDoubleClick={()=>{
+                const dayStr = formatLocalDateTime(new Date()).slice(0,10);
+                const dateInput = window.prompt('Schedule date (YYYY-MM-DD)', dayStr);
+                if (!dateInput) return;
+                const mh = window.prompt('Man-hours (blank=0)','');
+                const dt = new Date(dateInput);
+                if (isNaN(dt.getTime())) { setToast({ message: 'Invalid date', ts: Date.now() }); return; }
+                dt.setHours(CORE_START_HOUR||8,0,0,0);
+                schedulePending(p, formatLocalDateTime(dt), mh);
+              }}
+            >
+              <div style={{ fontWeight:600, fontSize:12 }}>{p.job_number}</div>
+              <div style={{ whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{p.title}</div>
+              {p.building_name && <div style={{ color:'#555' }}>{p.building_name}</div>}
+            </div>
+          ))}
+          {pendingError && <div style={{ color:'#b71c1c', fontSize:11 }}>{pendingError}</div>}
+          <button style={{ fontSize:10, marginTop:4 }} onClick={loadPending}>Refresh</button>
+        </div>
+      )}
+      <div style={{ marginLeft: pending.length ? 190 : 0, height:'100%' }}>
+  {driveWarn && (
         <div style={{ position:'fixed', bottom:10, left:10, background:'#ff9800', color:'#fff', padding:'6px 10px', borderRadius:4, fontSize:12, zIndex:3000 }}>
           {driveWarn}
           <button onClick={()=>setDriveWarn(null)} style={{ marginLeft:8, background:'rgba(0,0,0,0.15)', color:'#fff', border:'none', cursor:'pointer' }}>×</button>
@@ -813,6 +936,13 @@ export default function CalendarView() {
         <div style={{ position:'fixed', top:10, right:10, background:'#1e88e5', color:'#fff', padding:'8px 12px', borderRadius:6, boxShadow:'0 2px 8px rgba(0,0,0,0.3)', zIndex:2000, fontSize:13 }}>
           {toast.message}
           <button onClick={()=>setToast(null)} style={{ marginLeft:8, background:'transparent', border:'none', color:'#fff', cursor:'pointer', fontWeight:600 }}>×</button>
+        </div>
+      )}
+      {pendingDrag && (
+        <div style={{ position:'fixed', left: pendingDrag.x+8, top: pendingDrag.y+8, pointerEvents:'none', background:'#fff', border:'1px solid #888', borderRadius:6, padding:'4px 6px', fontSize:11, boxShadow:'0 2px 6px rgba(0,0,0,0.3)', zIndex:4000, width:160 }}>
+          <div style={{ fontWeight:600 }}>{pendingDrag.job.job_number}</div>
+          <div style={{ whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{pendingDrag.job.title}</div>
+          <div style={{ fontSize:10, color:'#555' }}>Drag onto a calendar day to schedule</div>
         </div>
       )}
       {movePreview && (
@@ -1010,19 +1140,27 @@ export default function CalendarView() {
         dayPropGetter={(date)=>{
           const holidays = Array.isArray(schedSettings?.holidays) ? schedSettings.holidays : [];
           const ds = date.toISOString().slice(0,10);
-          if (holidays.includes(ds)) {
-            return { style: { backgroundColor: '#fff2f2' } };
-          }
+          const past = isPastDate(date);
+          const style = {};
+          if (past) { Object.assign(style, { background:'#f1f1f1', opacity:0.75, cursor:'not-allowed' }); }
+          if (holidays.includes(ds)) { style.backgroundColor = '#fff2f2'; }
+          if (Object.keys(style).length) return { style, className: past? 'rbc-day-locked':'' };
           return {};
         }}
         slotPropGetter={(date)=>{
+          if (isPastDate(date)) {
+            return { style: { background:'#f5f5f5', opacity:0.6, cursor:'not-allowed' }, className:'rbc-slot-locked' };
+          }
+          // Preserve existing availability highlighting if such state variables exist
           try {
-            if(!schedSettings || !schedSettings.availability || !Array.isArray(selectedInstallers) || selectedInstallers.length===0) return {};
             const day = date.toISOString().slice(0,10);
             const hour = date.getHours();
-            const allOut = selectedInstallers.every(instId=>{
+            // selectedInstallers may not exist; guard
+            const sel = (typeof selectedInstallers !== 'undefined') ? selectedInstallers : [];
+            if(!schedSettings || !schedSettings.availability || !Array.isArray(sel) || sel.length===0) return {};
+            const allOut = sel.every(instId=>{
               const instAvailDay = (schedSettings.availability[instId]||{})[day];
-              if(!instAvailDay) return false; // no record means available
+              if(!instAvailDay) return false;
               if(instAvailDay.out) return true;
               if(instAvailDay.outHours && Array.isArray(instAvailDay.outHours)) return instAvailDay.outHours.includes(hour);
               return false;
@@ -1031,9 +1169,7 @@ export default function CalendarView() {
               return { style: { backgroundColor: '#ffe9e9' } };
             }
             return {};
-          } catch(err){
-            return {};
-          }
+          } catch(err){ return {}; }
         }}
       />
       {/* Daily hours summary sidebar - only in Day view, draggable */}
@@ -1324,9 +1460,14 @@ export default function CalendarView() {
                     </label>
                   </div>
                 </div>
-                <div style={{ textAlign: 'right' }}>
-                  <button type="submit" disabled={(exceed && !overrideDailyLimit) || weekendBlocked || (overlapConflict && !overrideDailyLimit)}>Save</button>
-                  <button type="button" style={{ marginLeft: 8 }} onClick={() => setShowForm(false)}>Cancel</button>
+                <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginTop:12 }}>
+                  <label style={{ fontSize:12, display:'flex', alignItems:'center', gap:6 }} title="If checked, will immediately schedule on provided date.">
+                    <input type="checkbox" checked={scheduleNow} onChange={e=>setScheduleNow(e.target.checked)} /> Schedule Now
+                  </label>
+                  <div style={{ textAlign: 'right' }}>
+                    <button type="submit" disabled={!form.job_number}>Save</button>
+                    <button type="button" style={{ marginLeft: 8 }} onClick={() => setShowForm(false)}>Cancel</button>
+                  </div>
                 </div>
               </form>
             </div>
@@ -1408,6 +1549,7 @@ export default function CalendarView() {
           )}
         </>
       )}
+      </div>
     </div>
   );
 }

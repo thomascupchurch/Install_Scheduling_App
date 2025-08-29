@@ -91,6 +91,28 @@ let db;
   try { await db.exec('ALTER TABLE schedules ADD COLUMN pace_description TEXT'); } catch {}
   try { await db.exec('ALTER TABLE schedules ADD COLUMN pace_man_hours REAL'); } catch {}
   try { await db.exec('ALTER TABLE schedules ADD COLUMN pace_address TEXT'); } catch {}
+  // Pending jobs table for unscheduled install requests
+  await db.exec(`CREATE TABLE IF NOT EXISTS pending_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_number TEXT UNIQUE NOT NULL,
+    title TEXT,
+    description TEXT,
+    address TEXT,
+    source_type TEXT,
+    customer_name TEXT,
+    building_name TEXT,
+    onsite_contact_first TEXT,
+    onsite_contact_last TEXT,
+    onsite_contact_phone TEXT,
+    salesperson TEXT,
+    project_manager TEXT,
+    project_manager_phone TEXT,
+    notes TEXT,
+    file_ref TEXT,
+    man_hours REAL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )`);
+  try { await db.exec('ALTER TABLE pending_jobs ADD COLUMN man_hours REAL'); } catch {}
   // Installers table
   await db.exec(`CREATE TABLE IF NOT EXISTS installers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -846,21 +868,17 @@ app.post('/api/import/install-requests', upload.single('file'), async (req,res)=
       const file_ref = colMap.fileUpload>=0 ? parts[colMap.fileUpload] : '';
       try {
         let result;
-        try {
-          result = await db.run(
-            'INSERT INTO schedules (job_number, title, date, description, man_hours, address, source_type, customer_name, building_name, onsite_contact_first, onsite_contact_last, onsite_contact_phone, salesperson, project_manager, project_manager_phone, notes, file_ref) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-            [job_number, customer_name || building_name || job_number, date, building_name, null, address, 'install_request', customer_name, building_name, onsite_first, onsite_last, onsite_contact_phone, salesperson, project_manager, project_manager_phone, notes, file_ref]
-          );
-          imported++;
-        } catch (insErr) {
-          // Likely duplicate job_number: upgrade existing 'pace' row if present
-          const existing = await db.get('SELECT id, source_type FROM schedules WHERE job_number = ?', [job_number]);
-          if (existing) {
-            await db.run('UPDATE schedules SET title = ?, date = ?, description = ?, address = ?, source_type = ?, customer_name = ?, building_name = ?, onsite_contact_first = ?, onsite_contact_last = ?, onsite_contact_phone = ?, salesperson = ?, project_manager = ?, project_manager_phone = ?, notes = ?, file_ref = ? WHERE id = ?', [customer_name || building_name || job_number, date, building_name, address, 'install_request', customer_name, building_name, onsite_first, onsite_last, onsite_contact_phone, salesperson, project_manager, project_manager_phone, notes, file_ref, existing.id]);
-            duplicates++;
-          } else {
-            errors++;
-          }
+        // If already scheduled, upgrade existing; else create pending job (no schedule yet)
+        const existing = await db.get('SELECT id FROM schedules WHERE job_number = ?', [job_number]);
+        if (existing) {
+          await db.run('UPDATE schedules SET title = ?, description = ?, address = ?, source_type = ?, customer_name = ?, building_name = ?, onsite_contact_first = ?, onsite_contact_last = ?, onsite_contact_phone = ?, salesperson = ?, project_manager = ?, project_manager_phone = ?, notes = ?, file_ref = ? WHERE id = ?', [customer_name || building_name || job_number, building_name, address, 'install_request', customer_name, building_name, onsite_first, onsite_last, onsite_contact_phone, salesperson, project_manager, project_manager_phone, notes, file_ref, existing.id]);
+          duplicates++;
+        } else {
+          // Insert into pending_jobs (ignore duplicates quietly)
+          try {
+            await db.run('INSERT OR IGNORE INTO pending_jobs (job_number, title, description, address, source_type, customer_name, building_name, onsite_contact_first, onsite_contact_last, onsite_contact_phone, salesperson, project_manager, project_manager_phone, notes, file_ref, man_hours) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', [job_number, customer_name || building_name || job_number, building_name, address, 'install_request', customer_name, building_name, onsite_first, onsite_last, onsite_contact_phone, salesperson, project_manager, project_manager_phone, notes, file_ref, null]);
+            imported++;
+          } catch { errors++; }
         }
       } catch (err) {
         errors++;
@@ -870,6 +888,53 @@ app.post('/api/import/install-requests', upload.single('file'), async (req,res)=
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
+});
+
+// List pending jobs
+app.get('/api/pending-jobs', async (req,res)=>{
+  try {
+    const rows = await db.all('SELECT * FROM pending_jobs ORDER BY created_at DESC');
+    res.json(rows);
+  } catch(e){ res.status(500).json({ error: e.message }); }
+});
+
+// Create a pending job manually (manual entry form now stages instead of scheduling directly)
+app.post('/api/pending-jobs', async (req,res)=>{
+  try {
+  const { job_number, title, description, address, customer_name, building_name, onsite_contact_first, onsite_contact_last, onsite_contact_phone, salesperson, project_manager, project_manager_phone, notes, file_ref, man_hours } = req.body || {};
+    if (!job_number) return res.status(400).json({ error: 'job_number required' });
+    // If already exists as scheduled, reject (user should edit existing)
+    const existingSched = await db.get('SELECT id FROM schedules WHERE job_number = ?', [job_number]);
+    if (existingSched) return res.status(409).json({ error: 'Job number already scheduled' });
+    // If already in pending, return that (idempotent)
+    const existingPending = await db.get('SELECT * FROM pending_jobs WHERE job_number = ?', [job_number]);
+    if (existingPending) return res.status(200).json(existingPending);
+  const stmt = await db.run('INSERT INTO pending_jobs (job_number, title, description, address, source_type, customer_name, building_name, onsite_contact_first, onsite_contact_last, onsite_contact_phone, salesperson, project_manager, project_manager_phone, notes, file_ref, man_hours) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', [job_number, title || description || job_number, description, address, 'manual', customer_name, building_name, onsite_contact_first, onsite_contact_last, onsite_contact_phone, salesperson, project_manager, project_manager_phone, notes, file_ref, man_hours || null]);
+    const created = await db.get('SELECT * FROM pending_jobs WHERE id = ?', [stmt.lastID]);
+    res.status(201).json(created);
+  } catch(e){
+    if (String(e.message).includes('UNIQUE')) return res.status(409).json({ error: 'Job number already pending' });
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// Schedule a pending job (promote to schedules)
+app.post('/api/pending-jobs/:id/schedule', async (req,res)=>{
+  try {
+    const { id } = req.params;
+    const { date, man_hours } = req.body || {};
+    if (!date) return res.status(400).json({ error: 'date required' });
+    const pj = await db.get('SELECT * FROM pending_jobs WHERE id = ?', [id]);
+    if (!pj) return res.status(404).json({ error: 'Pending job not found' });
+    // Insert into schedules (basic, no installers yet)
+  const mh = (man_hours != null) ? man_hours : (pj.man_hours != null ? pj.man_hours : 0);
+  const result = await db.run('INSERT INTO schedules (job_number, title, date, description, man_hours, address, source_type, customer_name, building_name, onsite_contact_first, onsite_contact_last, onsite_contact_phone, salesperson, project_manager, project_manager_phone, notes, file_ref) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', [pj.job_number, pj.title, date, pj.description, mh, pj.address, pj.source_type, pj.customer_name, pj.building_name, pj.onsite_contact_first, pj.onsite_contact_last, pj.onsite_contact_phone, pj.salesperson, pj.project_manager, pj.project_manager_phone, pj.notes, pj.file_ref]);
+    // Remove from pending
+    await db.run('DELETE FROM pending_jobs WHERE id = ?', [id]);
+    // Build initial slices (reuse slice generation from earlier function maybe minimal: single slice if man_hours provided)
+    // For now, rely on front-end edits to adjust man_hours/installers later.
+    res.json({ scheduled_id: result.lastID });
+  } catch(e){ res.status(400).json({ error: e.message }); }
 });
 
 app.listen(port, () => {
