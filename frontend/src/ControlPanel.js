@@ -3,7 +3,6 @@ import { useCoreHours } from './CoreHoursContext';
 
 
 export default function ControlPanel() {
-  const [setting, setSetting] = useState('');
   const { coreStart, setCoreStart, coreEnd, setCoreEnd } = useCoreHours();
   const fileInput = useRef();
   const [imported, setImported] = useState(null);
@@ -73,12 +72,6 @@ export default function ControlPanel() {
         </label>
         <button onClick={handleHomeBaseSave} style={{ marginLeft: 8 }}>Save</button>
         {homeBaseSaved && <span style={{ color: 'green', marginLeft: 8 }}>Saved!</span>}
-      </div>
-      <div>
-        <label>
-          Example Setting:
-          <input value={setting} onChange={e => setSetting(e.target.value)} />
-        </label>
       </div>
       <div style={{ marginTop: 20 }}>
         <label>

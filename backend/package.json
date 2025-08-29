@@ -12,7 +12,10 @@
     "multer": "^1.4.5-lts.1",
     "sqlite": "^5.1.1",
     "sqlite3": "^5.1.7",
-    "xlsx": "^0.18.5"
+  "xlsx": "^0.18.5",
+  "nodemailer": "^6.9.13",
+  "node-fetch": "^3.3.2"
+  ,"dotenv": "^16.4.5"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"

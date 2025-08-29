@@ -4,7 +4,7 @@ import withDragAndDrop from 'react-big-calendar/lib/addons/dragAndDrop';
 import 'react-big-calendar/lib/addons/dragAndDrop/styles.css';
 import 'react-big-calendar/lib/css/react-big-calendar.css';
 import { format, parse, startOfWeek, getDay } from 'date-fns';
-import { getDrivingTimeMinutes } from './drivingTime';
+import { getDrivingTimeMinutes, prefetchDrivingTimes, getCachedDistanceKm } from './drivingTime';
 
 const locales = { 'en-US': require('date-fns/locale/en-US') };
 const localizer = dateFnsLocalizer({ format, parse, startOfWeek: () => startOfWeek(new Date(), { weekStartsOn: 0 }), getDay, locales });
@@ -41,52 +41,72 @@ const coreSpan = () => Math.max(0, CORE_END_HOUR - CORE_START_HOUR);
 // (Assuming symmetric drive times). If user supplies a later custom start time on day 1, that overrides 08:00+driveOut.
 // If total (driveOut + driveReturn) >= core span, that day yields no workable hours and we skip to next day.
 async function buildEvents(job, homeBase, settings) {
+  // If backend provided slices (persisted spillover), use them directly for time blocks
+  const backendSlices = Array.isArray(job.slices) && job.slices.length ? job.slices : null;
   let startInput = job.date || job.start || job['Promise Date'] || job['Date Setup'];
-    if (typeof startInput === 'string' && /\d{4}-\d{2}-\d{2}$/.test(startInput)) startInput += 'T08:00:00'; 
-    const holidays = Array.isArray(schedSettings?.holidays) ? schedSettings.holidays : [];
-    const dayStr = d.toISOString().slice(0,10);
-    const isWeekend = d.getDay()===0 || d.getDay()===6 || holidays.includes(dayStr);
+  if (typeof startInput === 'string' && /\d{4}-\d{2}-\d{2}$/.test(startInput)) startInput += 'T08:00:00';
+  const holidays = Array.isArray(settings?.holidays) ? settings.holidays : [];
   let baseStart = new Date(startInput);
   if (isNaN(baseStart.getTime())) baseStart = new Date();
-
-  // Number of installers affects per-installer hours length for visualization
   const nInstallers = (Array.isArray(job.installers) && job.installers.length) ? job.installers.length : 1;
-  const totalManHours = Number(job.man_hours) || 0; // aggregate man-hours (sum across installers)
-  const clockHoursTotal = nInstallers ? totalManHours / nInstallers : totalManHours; // elapsed wall time
-
-  // If override: single continuous event starting at (baseStart + drive outbound)
-  let driveMinutesOut = 0;
+  const totalManHours = Number(job.man_hours) || 0;
+  const clockHoursTotal = nInstallers ? totalManHours / nInstallers : totalManHours;
+  let driveMinutesOut = 0; let travelDistanceKm = null; let driveMinutesReturn = 0;
   if (homeBase && job.address) {
     try { driveMinutesOut = await getDrivingTimeMinutes(homeBase, job.address); } catch { driveMinutesOut = 0; }
+    try { travelDistanceKm = getCachedDistanceKm(homeBase, job.address); } catch { travelDistanceKm = null; }
+    driveMinutesReturn = driveMinutesOut;
   }
-  // Allow asymmetric drive times from settings (if provided & numeric)
-  let driveMinutesReturn = driveMinutesOut;
   if (settings) {
-    if (settings.drive_out_minutes !== undefined) driveMinutesOut = Number(settings.drive_out_minutes) || 0;
-    if (settings.drive_return_minutes !== undefined) driveMinutesReturn = Number(settings.drive_return_minutes) || 0;
+    if (settings.drive_out_minutes !== undefined) driveMinutesOut = Number(settings.drive_out_minutes)||0;
+    if (settings.drive_return_minutes !== undefined) driveMinutesReturn = Number(settings.drive_return_minutes)||0;
   }
-
-  if (job.core_hours_override) {
-    const start = new Date(baseStart.getTime() + driveMinutesOut * 60000);
-    const end = new Date(start.getTime() + clockHoursTotal * 3600000);
-    const color = colorForJob(job);
-    return [{
-      id: `${job.id}-0`,
-      title: job.description || job.job_number,
-      start,
-      end,
-      jobLabel: `${job.job_number || ''} ${job.description || ''}`.trim(),
-      manHours: totalManHours,
-      color,
-  partIndex: 1,
-  partsTotal: 1,
-  partHours: clockHoursTotal,
-  remainingHours: 0,
-  clockHoursTotal,
-      resource: job
-    }];
+  // If override: keep legacy single span behavior unless backend gave slices (then trust slices)
+  if (job.core_hours_override && !backendSlices) {
+    const start = new Date(baseStart.getTime() + driveMinutesOut*60000);
+    const end = new Date(start.getTime() + clockHoursTotal*3600000);
+    return [{ id: `${job.id}-0`, title: job.description || job.job_number, start, end, jobLabel: `${job.job_number || ''} ${job.description || ''}`.trim(), manHours: totalManHours, color: colorForJob(job), partIndex:1, partsTotal:1, partHours: clockHoursTotal, remainingHours:0, clockHoursTotal, resource: job, travelDistanceKm, travelOutMinutes: driveMinutesOut, travelReturnMinutes: driveMinutesReturn }];
   }
-
+  // Use backend slices if available
+  if (backendSlices) {
+    const events = [];
+    let accruedClock = 0;
+    backendSlices.forEach((sl, idx) => {
+      const start = new Date(sl.date);
+      const end = new Date(start.getTime() + Number(sl.duration_hours||0)*3600000);
+      const isWeekend = start.getDay()===0 || start.getDay()===6 || holidays.includes(start.toISOString().slice(0,10));
+      const partHours = Number(sl.duration_hours)||0;
+      accruedClock += partHours;
+      const consumedMan = accruedClock * nInstallers;
+      const remainingMan = Math.max(0, totalManHours - consumedMan);
+      events.push({
+        id: `${job.id}-${idx}`,
+        title: job.description || job.job_number,
+        start,
+        end,
+        jobLabel: `${job.job_number || ''} ${job.description || ''}`.trim(),
+        manHours: totalManHours,
+        color: colorForJob(job),
+        partHours,
+        travelOutMinutes: driveMinutesOut,
+        travelReturnMinutes: driveMinutesReturn,
+        travelDistanceKm,
+        clockHoursTotal,
+        resource: job,
+        nonCore: isWeekend,
+        partIndex: idx+1,
+        partsTotal: backendSlices.length,
+        remainingHours: Number(remainingMan.toFixed(2))
+      });
+    });
+    if (events.length === 1) {
+      events[0].partIndex = 1; events[0].partsTotal = 1; events[0].remainingHours = 0;
+    } else {
+      events.forEach(ev => { ev.title = `${job.description || job.job_number} (Part ${ev.partIndex}/${ev.partsTotal})`; });
+    }
+    return events;
+  }
+  // fallback: legacy client slicing (should rarely happen now)
   // Split into multiple days inside core hours window, accounting for travel each day (both outbound + return).
   let remaining = clockHoursTotal; // remaining clock (elapsed) hours
   const events = [];
@@ -99,9 +119,8 @@ async function buildEvents(job, homeBase, settings) {
   // Loop while hours remain
   while (remaining > 0 && dayIndex < 100) { // safety cap
     const currentDay = new Date(day0.getTime() + dayIndex * 24 * 3600000);
-    const dow = currentDay.getDay();
-  const dayStrInner = curr.toISOString().slice(0,10);
-  const isWeekend = curr.getDay()===0 || curr.getDay()===6 || holidays.includes(dayStrInner);
+    const dayStrInner = currentDay.toISOString().slice(0,10);
+    const isWeekend = currentDay.getDay()===0 || currentDay.getDay()===6 || holidays.includes(dayStrInner);
     const dayAnchor = new Date(currentDay); // baseline 00:00 of that day
     let windowStart = new Date(dayAnchor);
     let windowEnd = new Date(dayAnchor);
@@ -148,8 +167,9 @@ async function buildEvents(job, homeBase, settings) {
   manHours: totalManHours,
       color: colorForJob(job),
   partHours: hoursThisDay,
-      travelOutMinutes: driveMinutesOut,
+  travelOutMinutes: driveMinutesOut,
       travelReturnMinutes: driveMinutesReturn,
+  travelDistanceKm,
   clockHoursTotal,
   resource: job,
   nonCore: isWeekend
@@ -205,10 +225,38 @@ export default function CalendarView() {
   const [settingsForm, setSettingsForm] = useState({ core_start_hour:'', core_end_hour:'', drive_out_minutes:'', drive_return_minutes:'' });
   const [toast, setToast] = useState(null); // { message, ts }
   const [movePreview, setMovePreview] = useState(null); // { job, iso, slices }
+  const [compactInstallers, setCompactInstallers] = useState(() => {
+    try { return localStorage.getItem('compactInstallers') === 'true'; } catch { return false; }
+  });
   const [skipMultiDayConfirm, setSkipMultiDayConfirm] = useState(()=>{
     try { return localStorage.getItem('skipMultiDayConfirm') === 'true'; } catch { return false; }
   });
+  const [showSendModal, setShowSendModal] = useState(false);
+  const [sendRange, setSendRange] = useState({ from: '', to: '' });
+  const [sending, setSending] = useState(false);
+  const [sendResults, setSendResults] = useState(null);
+  const [health, setHealth] = useState({ orsConfigured: true, checked:false });
+  const [driveWarn, setDriveWarn] = useState(null); // message string
+
+  async function handleSendCalendar(e) {
+    e.preventDefault();
+    setSending(true);
+    setSendResults(null);
+    try {
+      const payload = { fromDate: sendRange.from || undefined, toDate: sendRange.to || undefined };
+      const res = await fetch('/api/send-calendar-updates', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || 'Send failed');
+      setSendResults(body.results || []);
+      if (!body.results || !body.results.length) setToast({ message: 'No emails sent (missing emails or no jobs).', ts: Date.now() }); else setToast({ message: 'Calendar updates dispatched.', ts: Date.now() });
+    } catch (err) {
+      setSendResults([{ installer: '*', status: 'error', error: err.message }]);
+    } finally {
+      setSending(false);
+    }
+  }
   useEffect(()=>{ try { localStorage.setItem('skipMultiDayConfirm', String(skipMultiDayConfirm)); } catch {} }, [skipMultiDayConfirm]);
+  useEffect(()=>{ try { localStorage.setItem('compactInstallers', String(compactInstallers)); } catch {} }, [compactInstallers]);
   useEffect(()=>{ if (!toast) return; const t = setTimeout(()=> setToast(null), 6000); return ()=> clearTimeout(t); }, [toast]);
 
   function startDragSidebar(e){
@@ -265,6 +313,14 @@ export default function CalendarView() {
       const jobs = await r.json();
       const arrays = await Promise.all(jobs.map(j => buildEvents(j, hb, schedSettings)));
       setEvents(arrays.flat());
+      // Batch prefetch driving times for distinct addresses
+      if (hb) {
+        const addresses = jobs.map(j=>j.address).filter(a=>!!a);
+        const unique = [...new Set(addresses)];
+        if (unique.length) {
+          prefetchDrivingTimes(hb, unique).catch(()=>{});
+        }
+      }
     } catch (e) {
       setError(e.message);
     } finally {
@@ -288,6 +344,32 @@ export default function CalendarView() {
       }));
     } catch(e){ setError(e.message); } finally { setLoading(l=>({...l, settings:false})); }
   };
+  const loadHealth = async () => {
+    try {
+      const r = await fetch('/api/health');
+      if (!r.ok) throw new Error();
+      const d = await r.json();
+      setHealth({ orsConfigured: !!d.orsConfigured, checked:true });
+      if (!d.orsConfigured) setDriveWarn('Driving time disabled (missing ORS_API_KEY)');
+    } catch {
+      setHealth(h=>({ ...h, checked:true }));
+    }
+  };
+  // On mount also check health
+  useEffect(()=>{ loadHealth(); }, []);
+  // Capture drive time issues (wrap existing buildEvents uses would require patch; simple listener pattern)
+  useEffect(()=>{
+    const handler = (e) => {
+      if (e.detail?.type === 'drivingError') {
+        setDriveWarn(e.detail.message);
+      }
+    };
+    window.addEventListener('scheduleEvent', handler);
+    return () => {
+      window.removeEventListener('scheduleEvent', handler);
+    };
+  }, []);
+
   const retryAll = () => { setError(null); loadInstallers(); loadHomeBase(); loadSchedules(); };
 
   useEffect(() => { loadInstallers(); loadHomeBase(); loadSettings(); }, []);
@@ -330,6 +412,28 @@ export default function CalendarView() {
       // We compare against 8 clock hours per installer, so add ev.partHours directly.
       return sum + (Number(ev.partHours) || 0);
     }, 0);
+  }
+  // Available core hours for an installer on a date (excluding marked out hours)
+  function getInstallerAvailableCoreHours(installerId, dateStr) {
+    if (!dateStr) return coreSpan();
+    const availAll = schedSettings?.availability || {}; // structure: { date: { installerId: { out, outHours: [] } } }
+    const dayAvail = availAll[dateStr] || {};
+    const rec = dayAvail[installerId];
+    if (!rec) return coreSpan();
+    if (rec.out) return 0;
+    const outHours = Array.isArray(rec.outHours) ? rec.outHours : [];
+    // Count only hours within core window
+    let blocked = 0;
+    for (let h = CORE_START_HOUR; h < CORE_END_HOUR; h++) {
+      if (outHours.includes(h)) blocked++;
+    }
+    return Math.max(0, coreSpan() - blocked);
+  }
+  function toggleInstallerInForm(id) {
+    setForm(f => {
+      const exists = f.installers.includes(id);
+      return { ...f, installers: exists ? f.installers.filter(x=>x!==id) : [...f.installers, id] };
+    });
   }
   function wouldExceedLimit(installerIds, dateStr, totalManHours) {
     if (!dateStr || !totalManHours || !installerIds.length) return false;
@@ -661,6 +765,12 @@ export default function CalendarView() {
 
   return (
     <div style={{ height: 600, position: 'relative' }}>
+      {driveWarn && (
+        <div style={{ position:'fixed', bottom:10, left:10, background:'#ff9800', color:'#fff', padding:'6px 10px', borderRadius:4, fontSize:12, zIndex:3000 }}>
+          {driveWarn}
+          <button onClick={()=>setDriveWarn(null)} style={{ marginLeft:8, background:'rgba(0,0,0,0.15)', color:'#fff', border:'none', cursor:'pointer' }}>×</button>
+        </div>
+      )}
       {toast && (
         <div style={{ position:'fixed', top:10, right:10, background:'#1e88e5', color:'#fff', padding:'8px 12px', borderRadius:6, boxShadow:'0 2px 8px rgba(0,0,0,0.3)', zIndex:2000, fontSize:13 }}>
           {toast.message}
@@ -728,6 +838,7 @@ export default function CalendarView() {
         <button style={{ marginLeft: 8 }} disabled={!jobQuery} onClick={() => selectJobNumber(jobQuery)}>Go</button>
         <button style={{ marginLeft: 8 }} onClick={() => { setShowForm(true); }}>New</button>
   <button style={{ marginLeft: 8 }} onClick={()=> setShowSettings(true)}>Settings</button>
+  <button style={{ marginLeft: 8 }} onClick={()=> setShowSendModal(true)}>Send Calendar Updates</button>
       </div>
   <DnDCalendar
         localizer={localizer}
@@ -817,11 +928,21 @@ export default function CalendarView() {
               ? `Part ${event.partIndex}/${event.partsTotal} | Slice ${event.partHours} clock h | Remaining ${event.remainingHours} man-h of ${event.manHours} man-h (total clock ${event.clockHoursTotal}h)`
               : `${event.manHours} man-h (clock ${event.clockHoursTotal}h)`;
       const travelInfo = (event.travelOutMinutes || event.travelReturnMinutes) ? `Travel Out: ${event.travelOutMinutes||0}m | Return: ${event.travelReturnMinutes||0}m` : '';
-      const tooltip = `${event.jobLabel} \n${partsInfo}${travelInfo?`\n${travelInfo}`:''}`;
+      const distanceInfo = event.travelDistanceKm != null ? `Distance: ${event.travelDistanceKm} km` : '';
+      const tooltip = `${event.jobLabel} \n${partsInfo}${travelInfo?`\n${travelInfo}`:''}${distanceInfo?`\n${distanceInfo}`:''}`;
             return (
               <span title={tooltip} style={{ position:'relative', paddingRight:14, display:'inline-block', maxWidth:'100%' }}>
                 {event.jobLabel}
-        {travelInfo && <span style={{ display:'block', fontSize:9, opacity:0.85 }}>{travelInfo}</span>}
+        {(travelInfo || distanceInfo) && <span style={{ display:'block', fontSize:9, opacity:0.85 }}>
+          {travelInfo}{travelInfo && distanceInfo ? ' | ' : ''}{distanceInfo}
+        </span>}
+                {(job.override_hours || job.override_availability || job.core_hours_override) && (
+                  <span style={{ position:'absolute', left:2, top:2, display:'flex', gap:2 }}>
+                    {job.override_hours ? <span style={{ background:'#ff9800', color:'#fff', fontSize:8, padding:'1px 3px', borderRadius:3 }} title="Daily hours/overlap override">H</span> : null}
+                    {job.override_availability ? <span style={{ background:'#9c27b0', color:'#fff', fontSize:8, padding:'1px 3px', borderRadius:3 }} title="Availability override">A</span> : null}
+                    {job.core_hours_override ? <span style={{ background:'#607d8b', color:'#fff', fontSize:8, padding:'1px 3px', borderRadius:3 }} title="Core hours override">C</span> : null}
+                  </span>
+                )}
                 <button
                   type="button"
                   onClick={(e)=>{ e.stopPropagation(); startInlineEdit(job); }}
@@ -918,9 +1039,9 @@ export default function CalendarView() {
           <div style={{ fontSize: 10, color: '#666' }}>Red &gt; 8h (override).</div>
         </div>
       )}
-    {(selected || showForm || showSettings) && (
+  {(selected || showForm || showSettings || showSendModal) && (
         <>
-      <div onClick={() => { setSelected(null); setShowForm(false); setShowSettings(false); }} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 1000 }} />
+  <div onClick={() => { setSelected(null); setShowForm(false); setShowSettings(false); setShowSendModal(false); }} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 1000 }} />
           {/* Modal */}
           {selected && !showForm && (
             <div style={{ position: 'fixed', top: '10%', left: '50%', transform: 'translateX(-50%)', width: '80%', maxWidth: 760, background: '#fff', borderRadius: 6, boxShadow: '0 4px 16px rgba(0,0,0,0.3)', padding: 20, zIndex: 1001, maxHeight: '78%', overflow: 'auto' }}>
@@ -954,20 +1075,66 @@ export default function CalendarView() {
                     </label>
                   </div>
                   <div style={{ marginTop:10 }}>
-                    <label>Installers<br />
-                      <select multiple value={form.installers} onChange={e=>{ const opts=[...e.target.options].filter(o=>o.selected).map(o=>Number(o.value)); setForm(f=>({...f, installers:opts})); }} style={{ width:'100%', minHeight:110 }}>
-                        {installers.map(i=>{
-                          const dayStr = form.date ? form.date.slice(0,10):'';
+                    <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:4 }}>
+                      <div style={{ fontWeight:500 }}>Installers</div>
+                      <label style={{ fontSize:10, display:'flex', alignItems:'center', gap:4, cursor:'pointer' }}>
+                        <input type="checkbox" checked={compactInstallers} onChange={e=>setCompactInstallers(e.target.checked)} /> Compact
+                      </label>
+                    </div>
+                    {!compactInstallers && (
+                      <div style={{ maxHeight:140, overflowY:'auto', border:'1px solid #ddd', borderRadius:4, padding:6, background:'#fafafa', display:'grid', gap:4 }}>
+                        {installers.map(i => {
+                          const dayStr = form.date ? form.date.slice(0,10) : '';
                           const assigned = getInstallerAssignedHours(i.id, dayStr);
-                          const candidateIds = form.installers.includes(i.id) ? form.installers : [...form.installers, i.id];
-                          const perInstallerClock = form.man_hours && candidateIds.length ? Number(form.man_hours)/candidateIds.length : 0; // elapsed per installer
-                          const wouldExceed = assigned + perInstallerClock > 8.0001;
-                          // Allow choosing an installer with zero current hours even if job >8 man-hours (will span multiple days). Disable only if existing hours cause exceedance.
-                          const disabled = !overrideDailyLimit && !form.installers.includes(i.id) && wouldExceed && assigned > 0;
-                          return <option key={i.id} value={i.id} disabled={disabled}>{i.name} {assigned?`(${assigned.toFixed(1)}h)`:''}{disabled?' (limit)':''}</option>;
+                          const available = getInstallerAvailableCoreHours(i.id, dayStr);
+                          const selectedIds = form.installers;
+                          const nextSelected = selectedIds.includes(i.id) ? selectedIds : [...selectedIds, i.id];
+                          const perAdd = form.man_hours && nextSelected.length ? Number(form.man_hours)/nextSelected.length : 0;
+                          const predicted = selectedIds.includes(i.id) ? (assigned + (form.man_hours && selectedIds.length ? Number(form.man_hours)/selectedIds.length : 0)) : (assigned + perAdd);
+                          const wouldExceed = predicted > 8.0001 && !overrideDailyLimit;
+                          const outAll = available === 0;
+                          const warnAvail = !outAll && predicted > available && !(overrideDailyLimit || overrideAvailability);
+                          const labelColor = outAll ? '#b71c1c' : warnAvail ? '#e65100' : wouldExceed ? '#b71c1c' : '#222';
+                          return (
+                            <label key={i.id} style={{ display:'flex', alignItems:'center', gap:6, fontSize:11, background:selectedIds.includes(i.id)?'#e3f2fd':'#fff', padding:'4px 6px', border:'1px solid #ccc', borderRadius:4 }} title={`Assigned: ${assigned.toFixed(2)}h / Available: ${available}h${outAll?' (OUT)':''}`}>
+                              <input type="checkbox" checked={selectedIds.includes(i.id)} onChange={()=>toggleInstallerInForm(i.id)} />
+                              <span style={{ flex:1, color: labelColor, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{i.name}</span>
+                              <span style={{ fontSize:10, fontFamily:'monospace', color: labelColor }}>
+                                {outAll? 'OUT' : `${assigned.toFixed(1)}/${available}h`}
+                              </span>
+                              {warnAvail && <span style={{ background:'#ff9800', color:'#fff', fontSize:9, padding:'0 3px', borderRadius:3 }} title="Availability limit reached">A</span>}
+                              {wouldExceed && <span style={{ background:'#d32f2f', color:'#fff', fontSize:9, padding:'0 3px', borderRadius:3 }} title=">8h (needs override)">8+</span>}
+                            </label>
+                          );
                         })}
-                      </select>
-                    </label>
+                      </div>
+                    )}
+                    {compactInstallers && (
+                      <div style={{ maxHeight:140, overflowY:'auto', border:'1px solid #ddd', borderRadius:4, padding:4, background:'#fafafa', display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(90px,1fr))', gap:4 }}>
+                        {installers.map(i=>{
+                          const dayStr = form.date ? form.date.slice(0,10) : '';
+                          const assigned = getInstallerAssignedHours(i.id, dayStr);
+                          const available = getInstallerAvailableCoreHours(i.id, dayStr);
+                          const selected = form.installers.includes(i.id);
+                          const initials = i.name.split(/\s+/).map(p=>p[0]).slice(0,2).join('').toUpperCase();
+                          const outAll = available === 0;
+                          return (
+                            <div key={i.id} style={{ position:'relative', border:'1px solid #bbb', borderRadius:4, background:selected? '#1976d2' : '#fff', color:selected?'#fff':'#222', padding:'4px 4px 6px', fontSize:10, lineHeight:1.1 }} title={`${i.name}\nAssigned ${assigned.toFixed(2)}h / Available ${available}h${outAll?' (OUT)':''}`}>
+                              <label style={{ display:'flex', flexDirection:'column', alignItems:'flex-start', cursor:'pointer', gap:2 }}>
+                                <input type="checkbox" checked={selected} onChange={()=>toggleInstallerInForm(i.id)} style={{ transform:'scale(0.9)' }} />
+                                <span style={{ fontWeight:600 }}>{initials}</span>
+                                <span style={{ fontFamily:'monospace', fontSize:9 }}>
+                                  {outAll? 'OUT' : `${assigned.toFixed(1)}/${available}`}
+                                </span>
+                              </label>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                    <div style={{ fontSize:10, marginTop:4, color:'#555' }}>
+                      Legend: OUT = marked out all day; assigned/available within core hours. Compact shows initials.
+                    </div>
                   </div>
                   <div style={{ margin:'8px 0 10px' }}>
                     {exceed && !overrideDailyLimit && (
@@ -1025,23 +1192,66 @@ export default function CalendarView() {
                   </label>
                 </div>
                 <div style={{ marginBottom: 10 }}>
-                  <label>Installers<br />
-                    <select name="installers" multiple value={form.installers} onChange={handleChange} style={{ width: '100%', minHeight: 110 }}>
+                  <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:4 }}>
+                    <div style={{ fontWeight:500 }}>Installers</div>
+                    <label style={{ fontSize:10, display:'flex', alignItems:'center', gap:4, cursor:'pointer' }}>
+                      <input type="checkbox" checked={compactInstallers} onChange={e=>setCompactInstallers(e.target.checked)} /> Compact
+                    </label>
+                  </div>
+                  {!compactInstallers && (
+                    <div style={{ maxHeight:140, overflowY:'auto', border:'1px solid #ddd', borderRadius:4, padding:6, background:'#fafafa', display:'grid', gap:4 }}>
                       {installers.map(i => {
                         const dayStr = form.date ? form.date.slice(0,10) : '';
                         const assigned = getInstallerAssignedHours(i.id, dayStr);
-                        const candidateIds = form.installers.includes(i.id) ? form.installers : [...form.installers, i.id];
-                        const perInstallerClock = form.man_hours && candidateIds.length ? Number(form.man_hours) / candidateIds.length : 0;
-                        const wouldExceed = assigned + perInstallerClock > 8.0001;
-                        const disabled = !overrideDailyLimit && !form.installers.includes(i.id) && wouldExceed && assigned > 0;
+                        const available = getInstallerAvailableCoreHours(i.id, dayStr);
+                        const selectedIds = form.installers;
+                        const nextSelected = selectedIds.includes(i.id) ? selectedIds : [...selectedIds, i.id];
+                        const perAdd = form.man_hours && nextSelected.length ? Number(form.man_hours)/nextSelected.length : 0;
+                        const predicted = selectedIds.includes(i.id) ? (assigned + (form.man_hours && selectedIds.length ? Number(form.man_hours)/selectedIds.length : 0)) : (assigned + perAdd);
+                        const wouldExceed = predicted > 8.0001 && !overrideDailyLimit;
+                        const outAll = available === 0;
+                        const warnAvail = !outAll && predicted > available && !(overrideDailyLimit || overrideAvailability);
+                        const labelColor = outAll ? '#b71c1c' : warnAvail ? '#e65100' : wouldExceed ? '#b71c1c' : '#222';
                         return (
-                          <option key={i.id} value={i.id} disabled={disabled}>
-                            {i.name} {assigned ? `(${assigned.toFixed(1)}h)` : ''}{disabled ? ' (limit)' : ''}
-                          </option>
+                          <label key={i.id} style={{ display:'flex', alignItems:'center', gap:6, fontSize:11, background:selectedIds.includes(i.id)?'#e3f2fd':'#fff', padding:'4px 6px', border:'1px solid #ccc', borderRadius:4 }} title={`Assigned: ${assigned.toFixed(2)}h / Available: ${available}h${outAll?' (OUT)':''}`}>
+                            <input type="checkbox" checked={selectedIds.includes(i.id)} onChange={()=>toggleInstallerInForm(i.id)} />
+                            <span style={{ flex:1, color: labelColor, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{i.name}</span>
+                            <span style={{ fontSize:10, fontFamily:'monospace', color: labelColor }}>
+                              {outAll? 'OUT' : `${assigned.toFixed(1)}/${available}h`}
+                            </span>
+                            {warnAvail && <span style={{ background:'#ff9800', color:'#fff', fontSize:9, padding:'0 3px', borderRadius:3 }} title="Availability limit reached">A</span>}
+                            {wouldExceed && <span style={{ background:'#d32f2f', color:'#fff', fontSize:9, padding:'0 3px', borderRadius:3 }} title=">8h (needs override)">8+</span>}
+                          </label>
                         );
                       })}
-                    </select>
-                  </label>
+                    </div>
+                  )}
+                  {compactInstallers && (
+                    <div style={{ maxHeight:140, overflowY:'auto', border:'1px solid #ddd', borderRadius:4, padding:4, background:'#fafafa', display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(90px,1fr))', gap:4 }}>
+                      {installers.map(i=>{
+                        const dayStr = form.date ? form.date.slice(0,10) : '';
+                        const assigned = getInstallerAssignedHours(i.id, dayStr);
+                        const available = getInstallerAvailableCoreHours(i.id, dayStr);
+                        const selected = form.installers.includes(i.id);
+                        const initials = i.name.split(/\s+/).map(p=>p[0]).slice(0,2).join('').toUpperCase();
+                        const outAll = available === 0;
+                        return (
+                          <div key={i.id} style={{ position:'relative', border:'1px solid #bbb', borderRadius:4, background:selected? '#1976d2' : '#fff', color:selected?'#fff':'#222', padding:'4px 4px 6px', fontSize:10, lineHeight:1.1 }} title={`${i.name}\nAssigned ${assigned.toFixed(2)}h / Available ${available}h${outAll?' (OUT)':''}`}>
+                            <label style={{ display:'flex', flexDirection:'column', alignItems:'flex-start', cursor:'pointer', gap:2 }}>
+                              <input type="checkbox" checked={selected} onChange={()=>toggleInstallerInForm(i.id)} style={{ transform:'scale(0.9)' }} />
+                              <span style={{ fontWeight:600 }}>{initials}</span>
+                              <span style={{ fontFamily:'monospace', fontSize:9 }}>
+                                {outAll? 'OUT' : `${assigned.toFixed(1)}/${available}`}
+                              </span>
+                            </label>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                  <div style={{ fontSize:10, marginTop:4, color:'#555' }}>
+                    Legend: OUT = marked out all day; assigned/available within core hours. Compact shows initials.
+                  </div>
                 </div>
                 <div style={{ marginBottom: 14 }}>
                   <label style={{ cursor: 'pointer' }}>
@@ -1120,6 +1330,39 @@ export default function CalendarView() {
                 </div>
               </form>
               <div style={{ marginTop:12, fontSize:11, color:'#555' }}>Changes apply to future slicing immediately after save; existing events are regenerated.</div>
+            </div>
+          )}
+          {showSendModal && (
+            <div style={{ position: 'fixed', top: '14%', left: '50%', transform: 'translateX(-50%)', width: '90%', maxWidth: 520, background:'#fff', borderRadius:6, boxShadow:'0 4px 16px rgba(0,0,0,0.35)', padding:20, zIndex:1001 }}>
+              <h3 style={{ marginTop:0 }}>Send Calendar Updates</h3>
+              <p style={{ fontSize:12, marginTop:4 }}>Sends Outlook-compatible ICS attachments to installers with a saved email for the selected date range. Only jobs they are assigned to are included.</p>
+              <form onSubmit={handleSendCalendar}>
+                <div style={{ display:'flex', gap:16, flexWrap:'wrap' }}>
+                  <label style={{ flex:'1 1 180px' }}>From (inclusive)<br />
+                    <input type="date" value={sendRange.from} onChange={e=> setSendRange(r=>({...r, from: e.target.value}))} />
+                  </label>
+                  <label style={{ flex:'1 1 180px' }}>To (inclusive)<br />
+                    <input type="date" value={sendRange.to} onChange={e=> setSendRange(r=>({...r, to: e.target.value}))} />
+                  </label>
+                </div>
+                <div style={{ fontSize:11, color:'#555', marginTop:8 }}>If blank, defaults to today through two weeks ahead.</div>
+                <div style={{ textAlign:'right', marginTop:16 }}>
+                  <button type="submit" disabled={sending}>{sending? 'Sending...':'Send'}</button>
+                  <button type="button" style={{ marginLeft:8 }} onClick={()=>{ setShowSendModal(false); setSendResults(null); }}>Close</button>
+                </div>
+              </form>
+              {sendResults && (
+                <div style={{ marginTop:16, maxHeight:180, overflowY:'auto', border:'1px solid #ddd', borderRadius:4, padding:8, background:'#fafafa' }}>
+                  <strong style={{ fontSize:12 }}>Results:</strong>
+                  <ul style={{ margin:0, paddingLeft:18, fontSize:12 }}>
+                    {sendResults.map((r,i)=>(
+                      <li key={i} style={{ color: r.status==='error' ? '#b71c1c' : '#1b5e20' }}>
+                        {r.installer}: {r.status}{r.count!==undefined?` (${r.count} events)`:''}{r.error?` - ${r.error}`:''}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </div>
           )}
         </>

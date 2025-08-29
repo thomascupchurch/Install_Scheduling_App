@@ -1,27 +1,65 @@
-// Utility to get driving time (in minutes) between two addresses using OpenRouteService API
-// Requires an API key from https://openrouteservice.org/
-// Usage: await getDrivingTimeMinutes('address1', 'address2')
+// Frontend utility to request driving time (minutes) from backend cached endpoint
+// Usage: await getDrivingTimeMinutes('origin address', 'destination address')
 
-const ORS_API_KEY = 'YOUR_ORS_API_KEY'; // <-- Replace with your OpenRouteService API key
+const memCache = new Map(); // key: origin||'__'||destination -> { minutes, distance_km, ts }
+const TTL = 1000 * 60 * 30; // 30 min
 
-async function geocodeAddress(address) {
-  const url = `https://api.openrouteservice.org/geocode/search?api_key=${ORS_API_KEY}&text=${encodeURIComponent(address)}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error('Geocoding failed');
+export async function getDrivingTimeMinutes(origin, destination) {
+  if (!origin || !destination) return null;
+  const key = origin + '||' + destination;
+  const now = Date.now();
+  const cached = memCache.get(key);
+  if (cached && (now - cached.ts) < TTL) return cached.minutes;
+  let res;
+  try {
+    res = await fetch('/api/driving-time', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ origin, destination }) });
+  } catch (e) {
+    console.warn('Driving time network error', e);
+    return null;
+  }
+  if (!res.ok) {
+    // Capture specific backend error (e.g., missing key or quota) for optional UI usage
+    try {
+      const errBody = await res.json();
+      if (errBody?.error?.includes('key not configured')) {
+        console.warn('Driving time disabled: ORS key not configured.');
+      } else if (errBody?.error?.match(/quota|limit/i)) {
+        console.warn('Driving time quota reached. Using null.');
+      } else {
+        console.warn('Driving time lookup failed', errBody);
+      }
+    } catch {}
+    return null;
+  }
   const data = await res.json();
-  if (!data.features || !data.features.length) throw new Error('No geocode result');
-  return data.features[0].geometry.coordinates; // [lon, lat]
+  if (data.minutes == null) return null;
+  memCache.set(key, { minutes: data.minutes, distance_km: data.distance_km, ts: now });
+  return data.minutes;
 }
 
-export async function getDrivingTimeMinutes(fromAddress, toAddress) {
-  if (!fromAddress || !toAddress) return null;
-  const [fromLon, fromLat] = await geocodeAddress(fromAddress);
-  const [toLon, toLat] = await geocodeAddress(toAddress);
-  const url = `https://api.openrouteservice.org/v2/directions/driving-car?api_key=${ORS_API_KEY}&start=${fromLon},${fromLat}&end=${toLon},${toLat}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error('Routing failed');
+// Batch prefetch relative to home base; addresses array of job addresses
+export async function prefetchDrivingTimes(homeBase, addresses) {
+  if (!homeBase || !Array.isArray(addresses) || !addresses.length) return [];
+  const res = await fetch('/api/driving-time/prefetch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ homeBase, addresses })
+  });
+  if (!res.ok) throw new Error('Prefetch failed');
   const data = await res.json();
-  if (!data.routes || !data.routes.length) throw new Error('No route found');
-  const seconds = data.routes[0].summary.duration;
-  return Math.round(seconds / 60); // minutes
+  const now = Date.now();
+  (data.results||[]).forEach(r => {
+    if (r.minutes != null) {
+      const key = homeBase + '||' + r.address;
+      memCache.set(key, { minutes: r.minutes, distance_km: r.distance_km, ts: now });
+    }
+  });
+  return data.results || [];
+}
+
+// Access distance from cache (km) without triggering request
+export function getCachedDistanceKm(origin, destination) {
+  const key = origin + '||' + destination;
+  const rec = memCache.get(key);
+  return rec?.distance_km ?? null;
 }
