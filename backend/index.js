@@ -51,7 +51,18 @@ let db;
   core_hours_override INTEGER DEFAULT 0,
   override_hours INTEGER DEFAULT 0,
   override_availability INTEGER DEFAULT 0,
-    address TEXT
+  address TEXT,
+  source_type TEXT, -- 'pace' or 'csv'
+  customer_name TEXT,
+  building_name TEXT,
+  onsite_contact_first TEXT,
+  onsite_contact_last TEXT,
+  onsite_contact_phone TEXT,
+  salesperson TEXT,
+  project_manager TEXT,
+  project_manager_phone TEXT,
+  notes TEXT,
+  file_ref TEXT
   )`);
   // Add columns for migration if missing
   try { await db.exec('ALTER TABLE schedules ADD COLUMN man_hours REAL'); } catch {}
@@ -61,6 +72,25 @@ let db;
   try { await db.exec('ALTER TABLE schedules ADD COLUMN core_hours_override INTEGER DEFAULT 0'); } catch {}
   try { await db.exec('ALTER TABLE schedules ADD COLUMN override_hours INTEGER DEFAULT 0'); } catch {}
   try { await db.exec('ALTER TABLE schedules ADD COLUMN override_availability INTEGER DEFAULT 0'); } catch {}
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN source_type TEXT'); } catch {}
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN customer_name TEXT'); } catch {}
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN building_name TEXT'); } catch {}
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN onsite_contact_first TEXT'); } catch {}
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN onsite_contact_last TEXT'); } catch {}
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN onsite_contact_phone TEXT'); } catch {}
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN salesperson TEXT'); } catch {}
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN project_manager TEXT'); } catch {}
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN project_manager_phone TEXT'); } catch {}
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN notes TEXT'); } catch {}
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN file_ref TEXT'); } catch {}
+  // Rename legacy csv source_type to install_request if present
+  try { await db.run("UPDATE schedules SET source_type='install_request' WHERE source_type='csv'"); } catch {}
+  // Additional columns for enriching with Pace data (without creating jobs from Pace directly going forward)
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN pace_title TEXT'); } catch {}
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN pace_date TEXT'); } catch {}
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN pace_description TEXT'); } catch {}
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN pace_man_hours REAL'); } catch {}
+  try { await db.exec('ALTER TABLE schedules ADD COLUMN pace_address TEXT'); } catch {}
   // Installers table
   await db.exec(`CREATE TABLE IF NOT EXISTS installers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -710,13 +740,14 @@ app.delete('/api/installers/:id', async (req, res) => {
 });
 
 // XLSX import route
+// Import Pace Jobs (XLSX) - enrichment only: DO NOT create new schedules; update matching install_request jobs
 app.post('/api/import', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   const workbook = XLSX.readFile(req.file.path);
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   const jobs = XLSX.utils.sheet_to_json(sheet);
-  let imported = 0;
-  let duplicates = 0;
+  let enriched = 0; // rows that updated an existing job
+  let unmatched = 0; // rows with no existing job to enrich
   for (const job of jobs) {
     // Map spreadsheet fields to DB fields
     const job_number = job['Job'] || job['Job Number'] || '';
@@ -738,14 +769,107 @@ app.post('/api/import', upload.single('file'), async (req, res) => {
     const address = addressParts.filter(Boolean).join(', ');
     if (!job_number || !title || !date) continue;
     try {
-      const result = await db.run(
-        'INSERT OR IGNORE INTO schedules (job_number, title, date, description, man_hours, address) VALUES (?, ?, ?, ?, ?, ?)',
-        [job_number, title, date, description, man_hours, address]
-      );
-      if (result.changes === 0) duplicates++; else imported++;
-    } catch {}
+      // Find existing schedule (prefer install_request origin)
+      const existing = await db.get('SELECT id, source_type FROM schedules WHERE job_number = ?', [job_number]);
+      if (!existing) { unmatched++; continue; }
+      // Enrich pace_* columns; do not overwrite core install_request fields
+      await db.run('UPDATE schedules SET pace_title = ?, pace_date = ?, pace_description = ?, pace_man_hours = ?, pace_address = ? WHERE id = ?', [title, date, description, man_hours, address, existing.id]);
+      enriched++;
+    } catch { unmatched++; }
   }
-  res.json({ imported, duplicates });
+  res.json({ enriched, unmatched });
+});
+
+// Import Install Request Forms (CSV) with headers:
+// "WO#","Production Completion Date","Customer Name","Building Name","On-Site Contact","On-Site Contact Number","Salesperson","Project Manager","Project Manager's Phone","Install Address","Street Address","City","State/Region/Province","Postal / Zip Code","Notes","File Upload"
+app.post('/api/import/install-requests', upload.single('file'), async (req,res)=>{
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  try {
+    const fs = await import('fs');
+    const raw = fs.readFileSync(req.file.path, 'utf8');
+    const lines = raw.split(/\r?\n/).filter(l=>l.trim().length>0);
+    if (!lines.length) return res.status(400).json({ error: 'Empty CSV' });
+    // Basic CSV parser supporting quotes
+    function parseLine(line){
+      const out=[]; let cur=''; let inQ=false; for (let i=0;i<line.length;i++){ const ch=line[i]; if (ch==='"'){ if (inQ && line[i+1]==='"'){ cur+='"'; i++; } else inQ=!inQ; } else if (ch===',' && !inQ){ out.push(cur.trim()); cur=''; } else { cur+=ch; } } out.push(cur.trim()); return out; }
+    const header = parseLine(lines[0]).map(h=>h.replace(/^\ufeff/,''));
+    const idx = (name) => header.findIndex(h=>h.toLowerCase()===name.toLowerCase());
+    const colMap = {
+      wo: idx('WO#'),
+      prodDate: idx('Production Completion Date'),
+      customer: idx('Customer Name'),
+      building: idx('Building Name'),
+      onsiteContact: idx('On-Site Contact'),
+      onsitePhone: idx('On-Site Contact Number'),
+      salesperson: idx('Salesperson'),
+      pm: idx('Project Manager'),
+      pmPhone: idx("Project Manager's Phone"),
+      installAddress: idx('Install Address'),
+      street: idx('Street Address'),
+      city: idx('City'),
+      state: idx('State/Region/Province'),
+      zip: idx('Postal / Zip Code'),
+      notes: idx('Notes'),
+      fileUpload: idx('File Upload')
+    };
+    let imported=0, duplicates=0, errors=0; const rows=[];
+    for (let li=1; li<lines.length; li++) {
+      const parts = parseLine(lines[li]); if (!parts.length) continue;
+      const job_number = colMap.wo>=0 ? parts[colMap.wo] : '';
+      if (!job_number) { errors++; continue; }
+      const prodDate = colMap.prodDate>=0 ? parts[colMap.prodDate] : '';
+      const date = prodDate ? new Date(prodDate).toISOString().slice(0,16) : new Date().toISOString().slice(0,16);
+      const customer_name = colMap.customer>=0 ? parts[colMap.customer] : '';
+      const building_name = colMap.building>=0 ? parts[colMap.building] : '';
+      const onsiteContactRaw = colMap.onsiteContact>=0 ? parts[colMap.onsiteContact] : '';
+      let onsite_first='', onsite_last='';
+      if (onsiteContactRaw) {
+        const seg = onsiteContactRaw.replace(/,/g,' ').trim().split(/\s+/);
+        onsite_first = seg[0]||''; onsite_last = seg.slice(1).join(' ');
+      }
+      const onsite_contact_phone = colMap.onsitePhone>=0 ? parts[colMap.onsitePhone] : '';
+      const salesperson = colMap.salesperson>=0 ? parts[colMap.salesperson] : '';
+      const project_manager = colMap.pm>=0 ? parts[colMap.pm] : '';
+      const project_manager_phone = colMap.pmPhone>=0 ? parts[colMap.pmPhone] : '';
+      const addrPieces = [];
+      const installAddr = colMap.installAddress>=0 ? parts[colMap.installAddress] : '';
+      if (installAddr) addrPieces.push(installAddr);
+      const street = colMap.street>=0 ? parts[colMap.street] : '';
+      const city = colMap.city>=0 ? parts[colMap.city] : '';
+      const state = colMap.state>=0 ? parts[colMap.state] : '';
+      const zip = colMap.zip>=0 ? parts[colMap.zip] : '';
+      if (street) addrPieces.push(street);
+      const cityLine = [city,state,zip].filter(Boolean).join(', ');
+      if (cityLine) addrPieces.push(cityLine);
+      const address = addrPieces.filter(Boolean).join(', ');
+      const notes = colMap.notes>=0 ? parts[colMap.notes] : '';
+      const file_ref = colMap.fileUpload>=0 ? parts[colMap.fileUpload] : '';
+      try {
+        let result;
+        try {
+          result = await db.run(
+            'INSERT INTO schedules (job_number, title, date, description, man_hours, address, source_type, customer_name, building_name, onsite_contact_first, onsite_contact_last, onsite_contact_phone, salesperson, project_manager, project_manager_phone, notes, file_ref) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            [job_number, customer_name || building_name || job_number, date, building_name, null, address, 'install_request', customer_name, building_name, onsite_first, onsite_last, onsite_contact_phone, salesperson, project_manager, project_manager_phone, notes, file_ref]
+          );
+          imported++;
+        } catch (insErr) {
+          // Likely duplicate job_number: upgrade existing 'pace' row if present
+          const existing = await db.get('SELECT id, source_type FROM schedules WHERE job_number = ?', [job_number]);
+          if (existing) {
+            await db.run('UPDATE schedules SET title = ?, date = ?, description = ?, address = ?, source_type = ?, customer_name = ?, building_name = ?, onsite_contact_first = ?, onsite_contact_last = ?, onsite_contact_phone = ?, salesperson = ?, project_manager = ?, project_manager_phone = ?, notes = ?, file_ref = ? WHERE id = ?', [customer_name || building_name || job_number, date, building_name, address, 'install_request', customer_name, building_name, onsite_first, onsite_last, onsite_contact_phone, salesperson, project_manager, project_manager_phone, notes, file_ref, existing.id]);
+            duplicates++;
+          } else {
+            errors++;
+          }
+        }
+      } catch (err) {
+        errors++;
+      }
+    }
+    res.json({ imported, duplicates, errors });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
 app.listen(port, () => {
