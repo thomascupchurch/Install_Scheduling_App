@@ -185,6 +185,13 @@ export default function CalendarView() {
   const [schedSettings, setSchedSettings] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsForm, setSettingsForm] = useState({ core_start_hour:'', core_end_hour:'', drive_out_minutes:'', drive_return_minutes:'' });
+  const [toast, setToast] = useState(null); // { message, ts }
+  const [movePreview, setMovePreview] = useState(null); // { job, iso, slices }
+  const [skipMultiDayConfirm, setSkipMultiDayConfirm] = useState(()=>{
+    try { return localStorage.getItem('skipMultiDayConfirm') === 'true'; } catch { return false; }
+  });
+  useEffect(()=>{ try { localStorage.setItem('skipMultiDayConfirm', String(skipMultiDayConfirm)); } catch {} }, [skipMultiDayConfirm]);
+  useEffect(()=>{ if (!toast) return; const t = setTimeout(()=> setToast(null), 6000); return ()=> clearTimeout(t); }, [toast]);
 
   function startDragSidebar(e){
     e.preventDefault();
@@ -304,14 +311,35 @@ export default function CalendarView() {
     return installerIds.some(id => getInstallerAssignedHours(id, dateStr.slice(0,10)) + perInstallerAdd > 8.0001);
   }
   const exceed = wouldExceedLimit(form.installers, form.date, form.man_hours);
+  const isWeekend = (()=>{ if(!form.date) return false; const d=new Date(form.date); const g=d.getDay(); return g===0||g===6; })();
+  const weekendBlocked = isWeekend && !form.core_hours_override;
+  function detectOverlap(startISO, manHours, installerIds, excludeJobId){
+    if(!startISO || !manHours || !installerIds || !installerIds.length) return false;
+    const start = new Date(startISO);
+    if(isNaN(start.getTime())) return false;
+    const perInstaller = Number(manHours)/(installerIds.length||1);
+    const end = new Date(start.getTime() + perInstaller*3600000);
+    return events.some(ev=>{
+      if (excludeJobId && ev.resource?.id === excludeJobId) return false;
+      if(!Array.isArray(ev.resource?.installers)) return false;
+      if(!ev.resource.installers.some(id=>installerIds.includes(id))) return false;
+      // same day check quick
+      if (ev.start.toISOString().slice(0,10)!== start.toISOString().slice(0,10)) return false;
+      return ev.start < end && start < ev.end;
+    });
+  }
+  const overlapConflict = detectOverlap(form.date, form.man_hours, form.installers);
   async function submit(e) {
     e.preventDefault();
+  if (weekendBlocked) { return; }
+  if (overlapConflict && !overrideDailyLimit) { setError('Overlap with existing assignment (enable override)'); return; }
     try {
       const payload = { ...form, title: form.description || form.job_number, override: overrideDailyLimit };
       const res = await fetch('/api/schedules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || `Create failed (${res.status})`);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `Create failed (${res.status})`);
+      if (body.shiftedWeekend) {
+        setToast({ message: `Weekend date auto-shifted to Monday (${body.original_date?.slice(0,10)} → ${body.date?.slice(0,10)})`, ts: Date.now() });
       }
     } catch (e) {
       setError(e.message);
@@ -362,9 +390,10 @@ export default function CalendarView() {
     try {
       const payload = { description: form.description, man_hours: form.man_hours, date: form.date, address: form.address, installers: form.installers, override: overrideDailyLimit };
       const res = await fetch(`/api/schedules/${selected.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      if (!res.ok) {
-        const body = await res.json().catch(()=>({}));
-        throw new Error(body.error || `Update failed (${res.status})`);
+      const body = await res.json().catch(()=>({}));
+      if (!res.ok) throw new Error(body.error || `Update failed (${res.status})`);
+      if (body.shiftedWeekend) {
+        setToast({ message: `Weekend date auto-shifted to Monday (${body.original_date?.slice(0,10)} → ${body.date?.slice(0,10)})`, ts: Date.now() });
       }
       setEditing(false);
       setSelected(null);
@@ -410,13 +439,20 @@ export default function CalendarView() {
         setInlineEdit(ie => ({ ...ie, loading: false, error: 'Per-installer limit >8h (enable override)' }));
         return;
       }
+      // Overlap check
+      const potentialISO = job.date || job.start_time || jobDate + 'T08:00';
+      if (detectOverlap(potentialISO, newMH, newInstallers, job.id)) {
+        setInlineEdit(ie => ({ ...ie, loading:false, error: 'Time overlap (enable override)' }));
+        return;
+      }
     }
     try {
       const payload = { description: inlineEdit.desc, man_hours: inlineEdit.mh, installers: newInstallers, override: overrideDailyLimit };
       const res = await fetch(`/api/schedules/${job.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      if (!res.ok) {
-        const body = await res.json().catch(()=>({}));
-        throw new Error(body.error || `Update failed (${res.status})`);
+      const body = await res.json().catch(()=>({}));
+      if (!res.ok) throw new Error(body.error || `Update failed (${res.status})`);
+      if (body.shiftedWeekend) {
+        setToast({ message: `Weekend date auto-shifted to Monday (${body.original_date?.slice(0,10)} → ${body.date?.slice(0,10)})`, ts: Date.now() });
       }
       cancelInlineEdit();
       loadSchedules();
@@ -431,12 +467,65 @@ export default function CalendarView() {
     // event.resource is the job; adjust its base date/time to new start (keep same time of day)
     const job = event.resource;
     if (!job) return;
-    const original = new Date(job.date || start);
-    const newStart = new Date(start);
-    // Compose new ISO date/time (keep minutes/hours from newStart)
+    const newStartRaw = new Date(start);
+    let newStart = new Date(newStartRaw);
+    // Snap logic: if dropped before core start -> set to core start; if after/end or insufficient window -> next business day core start
+    const perInstallerHours = (Number(job.man_hours)||0) / Math.max(1,(job.installers||[]).length||1);
+    const needsNextDay = () => {
+      const h = newStart.getHours() + newStart.getMinutes()/60;
+      if (h >= CORE_END_HOUR) return true;
+      // remaining core window today
+      const remainingToday = CORE_END_HOUR - h;
+      return remainingToday <= 0;
+    };
+    // Adjust early
+    if (newStart.getHours() < CORE_START_HOUR) {
+      newStart.setHours(CORE_START_HOUR,0,0,0);
+    } else if (needsNextDay()) {
+      // move to next day core start
+      newStart.setDate(newStart.getDate()+1);
+      newStart.setHours(CORE_START_HOUR,0,0,0);
+    }
+    // Skip weekends (Sat=6, Sun=0)
+    while (newStart.getDay()===0 || newStart.getDay()===6) {
+      newStart.setDate(newStart.getDate()+1);
+      newStart.setHours(CORE_START_HOUR,0,0,0);
+    }
     const iso = newStart.toISOString().slice(0,16);
+    if (newStart.getTime() !== newStartRaw.getTime()) {
+      setToast({ message: 'Dragged outside core hours: snapped to next core window.', ts: Date.now() });
+    }
+    // Inform if spillover will occur (multi-day automatic continuation)
+    const remainWindow = CORE_END_HOUR - (newStart.getHours() + newStart.getMinutes()/60);
+    if (perInstallerHours > remainWindow && remainWindow > 0) {
+      setToast({ message: 'Event exceeds remaining core hours today: continuing next business day automatically.', ts: Date.now() });
+    }
+    // Overlap pre-check unless overrideDailyLimit is active (reuse override toggle)
+    if (!overrideDailyLimit && detectOverlap(iso, job.man_hours, job.installers, job.id)) {
+      setToast({ message: 'Move blocked: overlapping assignment (enable override to force).', ts: Date.now() });
+      return; // do not persist
+    }
+    // Simulate slices to preview if multi-day result
     try {
-      const payload = { date: iso, override: true }; // allow move even if hours shift day allocations
+      const simulated = await buildEvents({ ...job, date: iso, core_hours_override: job.core_hours_override }, homeBase, schedSettings);
+      const multi = simulated.length > 1;
+      if (multi) {
+        if (skipMultiDayConfirm) {
+          // Directly commit without modal
+          const payload = { date: iso, override: overrideDailyLimit };
+          const res = await fetch(`/api/schedules/${job.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+          if (!res.ok) {
+            const body = await res.json().catch(()=>({}));
+            throw new Error(body.error || `Move failed (${res.status})`);
+          }
+          loadSchedules();
+        } else {
+          setMovePreview({ job, iso, slices: simulated.map(s=>({ start:s.start, end:s.end, hours: ((s.end - s.start)/3600000).toFixed(2) })) });
+          return;
+        }
+      }
+      // Single slice -> proceed immediately
+      const payload = { date: iso, override: overrideDailyLimit };
       const res = await fetch(`/api/schedules/${job.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       if (!res.ok) {
         const body = await res.json().catch(()=>({}));
@@ -454,8 +543,13 @@ export default function CalendarView() {
     // Multiply by installer count to get total man_hours (approx). If multi-part originally, this is a direct edit.
     const installerCount = Array.isArray(job.installers) && job.installers.length ? job.installers.length : 1;
     const newTotal = (hours * installerCount).toFixed(2);
+    const startISO = new Date(start).toISOString().slice(0,16);
+    if (!overrideDailyLimit && detectOverlap(startISO, newTotal, job.installers, job.id)) {
+      setToast({ message: 'Resize blocked: overlapping assignment (enable override to force).', ts: Date.now() });
+      return;
+    }
     try {
-      const payload = { man_hours: newTotal, override: true };
+      const payload = { man_hours: newTotal, override: overrideDailyLimit };
       const res = await fetch(`/api/schedules/${job.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       if (!res.ok) {
         const body = await res.json().catch(()=>({}));
@@ -467,6 +561,46 @@ export default function CalendarView() {
 
   return (
     <div style={{ height: 600, position: 'relative' }}>
+      {toast && (
+        <div style={{ position:'fixed', top:10, right:10, background:'#1e88e5', color:'#fff', padding:'8px 12px', borderRadius:6, boxShadow:'0 2px 8px rgba(0,0,0,0.3)', zIndex:2000, fontSize:13 }}>
+          {toast.message}
+          <button onClick={()=>setToast(null)} style={{ marginLeft:8, background:'transparent', border:'none', color:'#fff', cursor:'pointer', fontWeight:600 }}>×</button>
+        </div>
+      )}
+      {movePreview && (
+        <>
+          <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.35)', zIndex:2500 }} onClick={()=>setMovePreview(null)} />
+          <div style={{ position:'fixed', top:'15%', left:'50%', transform:'translateX(-50%)', width:'90%', maxWidth:520, background:'#fff', borderRadius:8, padding:18, boxShadow:'0 4px 20px rgba(0,0,0,0.35)', zIndex:2501 }}>
+            <h3 style={{ marginTop:0, marginBottom:10 }}>Confirm Multi-Day Move</h3>
+            <p style={{ margin:'4px 0 12px', fontSize:13 }}>Moving <strong>{movePreview.job.job_number || movePreview.job.description}</strong> will split into {movePreview.slices.length} day slices based on core hours. Review and confirm.</p>
+            <div style={{ maxHeight:220, overflowY:'auto', border:'1px solid #ddd', borderRadius:4, padding:8, background:'#fafafa', fontSize:12 }}>
+              {movePreview.slices.map((s,i)=>(
+                <div key={i} style={{ padding:'4px 0', borderBottom:i<movePreview.slices.length-1?'1px solid #e0e0e0':'none' }}>
+                  <strong>Part {i+1}</strong>: {s.start.toLocaleDateString()} {s.start.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} – {s.end.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} ({s.hours}h)
+                </div>
+              ))}
+            </div>
+            <div style={{ display:'flex', justifyContent:'flex-end', gap:10, marginTop:16 }}>
+              <label style={{ marginRight:'auto', fontSize:12, display:'flex', alignItems:'center', gap:6 }}>
+                <input type="checkbox" checked={skipMultiDayConfirm} onChange={e=>setSkipMultiDayConfirm(e.target.checked)} /> Don't ask again
+              </label>
+              <button onClick={()=>setMovePreview(null)}>Cancel</button>
+              <button onClick={async ()=>{
+                try {
+                  const payload = { date: movePreview.iso, override: overrideDailyLimit };
+                  const res = await fetch(`/api/schedules/${movePreview.job.id}`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+                  if (!res.ok) {
+                    const body = await res.json().catch(()=>({}));
+                    throw new Error(body.error || `Move failed (${res.status})`);
+                  }
+                  setMovePreview(null);
+                  loadSchedules();
+                } catch(err){ setError(err.message); }
+              }}>Confirm Move</button>
+            </div>
+          </div>
+        </>
+      )}
       {(loading.installers || loading.homeBase || loading.schedules) && (
         <div style={{ position: 'absolute', top: 0, right: 0, padding: '4px 8px', fontSize: 12, background: '#ffc107', color: '#222', borderBottomLeftRadius: 6, zIndex: 10 }}>
           Loading{loading.schedules ? ' schedules' : loading.installers ? ' installers' : ''}...
@@ -703,6 +837,16 @@ export default function CalendarView() {
                         Per-installer hours would exceed 8h. Adjust or override.
                       </div>
                     )}
+                    {overlapConflict && !overrideDailyLimit && (
+                      <div style={{ background:'#e3f2fd', border:'1px solid #90caf9', color:'#0d47a1', padding:'6px 8px', borderRadius:4, fontSize:12, marginBottom:6 }}>
+                        Time overlap with another assignment for a selected installer. Adjust, change installers, or override.
+                      </div>
+                    )}
+                      {weekendBlocked && (
+                        <div style={{ background:'#fdecea', border:'1px solid #f5c2c0', color:'#b71c1c', padding:'6px 8px', borderRadius:4, fontSize:12, marginBottom:6 }}>
+                          Weekend date requires "Allow work outside core hours" override.
+                        </div>
+                      )}
                     <label style={{ cursor:'pointer' }}>
                       <input type="checkbox" checked={overrideDailyLimit} onChange={e=>setOverrideDailyLimit(e.target.checked)} style={{ marginRight:6 }} /> Override 8h daily limit
                     </label>
@@ -772,12 +916,17 @@ export default function CalendarView() {
                       Per-installer hours would exceed 8h. Adjust inputs or override.
                     </div>
                   )}
+                  {weekendBlocked && (
+                    <div style={{ background:'#fdecea', border:'1px solid #f5c2c0', color:'#b71c1c', padding:'6px 8px', borderRadius:4, fontSize:12, marginBottom:6 }}>
+                      Weekend date requires outside core hours override.
+                    </div>
+                  )}
                   <label style={{ cursor: 'pointer' }}>
                     <input type="checkbox" checked={overrideDailyLimit} onChange={e => setOverrideDailyLimit(e.target.checked)} style={{ marginRight: 6 }} /> Override 8h daily limit
                   </label>
                 </div>
                 <div style={{ textAlign: 'right' }}>
-                  <button type="submit" disabled={exceed && !overrideDailyLimit}>Save</button>
+                  <button type="submit" disabled={(exceed && !overrideDailyLimit) || weekendBlocked || (overlapConflict && !overrideDailyLimit)}>Save</button>
                   <button type="button" style={{ marginLeft: 8 }} onClick={() => setShowForm(false)}>Cancel</button>
                 </div>
               </form>

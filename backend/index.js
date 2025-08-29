@@ -132,7 +132,23 @@ app.get('/api/schedules/:job_number', async (req, res) => {
 
 app.post('/api/schedules', async (req, res) => {
   try {
-    const { job_number, title, date, start_time, end_time, description, installers, man_hours, override } = req.body;
+    const { job_number, title, start_time, end_time, description, installers, man_hours, override, core_hours_override } = req.body;
+    let { date } = req.body; // allow mutation for weekend auto-shift
+    let original_date = date;
+    let shiftedWeekend = false;
+    // Weekend handling: auto-shift to next Monday if weekend and no override flags
+    if (date) {
+      const d = new Date(date);
+      if (!isNaN(d.getTime())) {
+        const dow = d.getDay();
+        if ((dow === 0 || dow === 6) && !override && !core_hours_override) {
+          const add = dow === 6 ? 2 : 1; // Sat->Mon +2, Sun->Mon +1
+          d.setDate(d.getDate() + add);
+          date = d.toISOString().slice(0,16); // keep to minute precision
+          shiftedWeekend = true;
+        }
+      }
+    }
     // Enforce 8-hour limit per installer per day unless override
     if (Array.isArray(installers) && installers.length && man_hours && !override) {
       const day = date.slice(0, 10);
@@ -148,9 +164,29 @@ app.post('/api/schedules', async (req, res) => {
         }
       }
     }
+    // Overlap detection (approximate): treat date as start, duration = per-installer hours; reject overlap unless override
+    if (Array.isArray(installers) && installers.length && man_hours && !override) {
+      const perInstallerHours = Number(man_hours) / installers.length;
+      const startTs = Date.parse(date) || Date.parse(date.replace(/$/,'T08:00:00'));
+      const endTs = startTs + perInstallerHours * 3600000;
+      const day = date.slice(0,10);
+      for (const installer_id of installers) {
+        const existing = await db.all('SELECT s.id, s.date, s.man_hours FROM schedules s JOIN schedule_installers si ON s.id = si.schedule_id WHERE si.installer_id=? AND s.date LIKE ?', [installer_id, `${day}%`]);
+        for (const row of existing) {
+          const otherStartTs = Date.parse(row.date) || Date.parse(row.date.replace(/$/,'T08:00:00'));
+          const cntRow = await db.get('SELECT COUNT(*) as cnt FROM schedule_installers WHERE schedule_id = ?', [row.id]);
+          const otherDur = ((Number(row.man_hours)||0) / Math.max(1, cntRow.cnt)) * 3600000;
+          const otherEndTs = otherStartTs + otherDur;
+          const overlaps = otherStartTs < endTs && startTs < otherEndTs;
+          if (overlaps) {
+            return res.status(400).json({ error: 'Time overlap detected for installer. Use override to allow.' });
+          }
+        }
+      }
+    }
     const result = await db.run(
-      'INSERT INTO schedules (job_number, title, date, start_time, end_time, description, man_hours) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [job_number, title, date, start_time, end_time, description, man_hours]
+  'INSERT INTO schedules (job_number, title, date, start_time, end_time, description, man_hours) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  [job_number, title, date, start_time, end_time, description, man_hours]
     );
     const schedule_id = result.lastID;
     if (Array.isArray(installers)) {
@@ -158,16 +194,31 @@ app.post('/api/schedules', async (req, res) => {
         await db.run('INSERT INTO schedule_installers (schedule_id, installer_id) VALUES (?, ?)', [schedule_id, installer_id]);
       }
     }
-    res.json({ id: schedule_id, job_number, title, date, start_time, end_time, description, installers, man_hours });
+  res.json({ id: schedule_id, job_number, title, date, start_time, end_time, description, installers, man_hours, shiftedWeekend, original_date: shiftedWeekend ? original_date : undefined });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
 });
 // PATCH endpoint to update description, man_hours, installers, address, etc.
 app.patch('/api/schedules/:id', async (req, res) => {
-  const { description, man_hours, date, start_time, end_time, installers, address, override } = req.body;
+  let { description, man_hours, date, start_time, end_time, installers, address, override, core_hours_override } = req.body;
   const { id } = req.params;
   try {
+    // Weekend handling on update: auto-shift to next Monday if setting to weekend and no override flags
+    let original_date = date;
+    let shiftedWeekend = false;
+    if (date) {
+      const d = new Date(date);
+      if (!isNaN(d.getTime())) {
+        const dow = d.getDay();
+        if ((dow === 0 || dow === 6) && !override && !core_hours_override) {
+          const add = dow === 6 ? 2 : 1;
+          d.setDate(d.getDate() + add);
+          date = d.toISOString().slice(0,16);
+          shiftedWeekend = true;
+        }
+      }
+    }
     // Enforce 8-hour limit per installer per day unless override
     if (Array.isArray(installers) && installers.length && man_hours && !override) {
       // Get the date for this job (from body or db)
@@ -188,6 +239,35 @@ app.patch('/api/schedules/:id', async (req, res) => {
           }
           if (assigned + (Number(man_hours) / installers.length) > 8) {
             return res.status(400).json({ error: 'Installer would exceed 8 hours for this day. Use override to allow.' });
+          }
+        }
+      }
+    }
+    // Overlap detection for updates (approximate) unless override
+    if (Array.isArray(installers) && installers.length && man_hours && !override) {
+      // determine effective date
+      let effDate = date;
+      if (!effDate) {
+        const job = await db.get('SELECT date FROM schedules WHERE id = ?', [id]);
+        effDate = job?.date;
+      }
+      if (effDate) {
+        const perInstallerHours = Number(man_hours) / installers.length;
+        const startTs = Date.parse(effDate) || Date.parse(effDate.replace(/$/,'T08:00:00'));
+        const endTs = startTs + perInstallerHours * 3600000;
+        const day = effDate.slice(0,10);
+        for (const installer_id of installers) {
+          const existing = await db.all('SELECT s.id, s.date, s.man_hours FROM schedules s JOIN schedule_installers si ON s.id = si.schedule_id WHERE si.installer_id=? AND s.date LIKE ?', [installer_id, `${day}%`]);
+          for (const row of existing) {
+            if (row.id == id) continue;
+            const otherStartTs = Date.parse(row.date) || Date.parse(row.date.replace(/$/,'T08:00:00'));
+            const cntRow = await db.get('SELECT COUNT(*) as cnt FROM schedule_installers WHERE schedule_id = ?', [row.id]);
+            const otherDur = ((Number(row.man_hours)||0) / Math.max(1, cntRow.cnt)) * 3600000;
+            const otherEndTs = otherStartTs + otherDur;
+            const overlaps = otherStartTs < endTs && startTs < otherEndTs;
+            if (overlaps) {
+              return res.status(400).json({ error: 'Time overlap detected for installer. Use override to allow.' });
+            }
           }
         }
       }
@@ -214,7 +294,7 @@ app.patch('/api/schedules/:id', async (req, res) => {
     const updated = await db.get('SELECT * FROM schedules WHERE id = ?', [id]);
     const updatedInstallers = await db.all('SELECT installer_id FROM schedule_installers WHERE schedule_id = ?', [id]);
     updated.installers = updatedInstallers.map(i => i.installer_id);
-    res.json(updated);
+  res.json({ ...updated, shiftedWeekend, original_date: shiftedWeekend ? original_date : undefined });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
