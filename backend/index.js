@@ -97,7 +97,8 @@ app.get('/api/schedules/:job_number', async (req, res) => {
 });
 
 app.post('/api/schedules', async (req, res) => {
-  const { job_number, title, date, start_time, end_time, description, installers, man_hours, override } = req.body;
+  try {
+    const { job_number, title, date, start_time, end_time, description, installers, man_hours, override } = req.body;
     // Enforce 8-hour limit per installer per day unless override
     if (Array.isArray(installers) && installers.length && man_hours && !override) {
       const day = date.slice(0, 10);
@@ -180,6 +181,18 @@ app.patch('/api/schedules/:id', async (req, res) => {
     const updatedInstallers = await db.all('SELECT installer_id FROM schedule_installers WHERE schedule_id = ?', [id]);
     updated.installers = updatedInstallers.map(i => i.installer_id);
     res.json(updated);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// Delete schedule (and its installer links)
+app.delete('/api/schedules/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await db.run('DELETE FROM schedule_installers WHERE schedule_id = ?', [id]);
+    await db.run('DELETE FROM schedules WHERE id = ?', [id]);
+    res.json({ success: true });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
