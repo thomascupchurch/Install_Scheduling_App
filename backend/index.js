@@ -80,22 +80,35 @@ app.post('/api/settings/home_base', async (req, res) => {
 
 // Core hours & drive settings
 app.get('/api/settings/scheduling', async (req, res) => {
-  const keys = ['core_start_hour','core_end_hour','drive_out_minutes','drive_return_minutes'];
+  const keys = ['core_start_hour','core_end_hour','drive_out_minutes','drive_return_minutes','holidays','availability'];
   const out = {};
   for (const k of keys) {
     const row = await db.get('SELECT value FROM settings WHERE key=?',[k]);
     out[k] = row ? row.value : null;
   }
+  // holidays stored as JSON string
+  if (out.holidays) {
+    try { out.holidays = JSON.parse(out.holidays); } catch { out.holidays = []; }
+  } else out.holidays = [];
+  if (out.availability) {
+    try { out.availability = JSON.parse(out.availability); } catch { out.availability = {}; }
+  } else out.availability = {};
   res.json(out);
 });
 app.post('/api/settings/scheduling', async (req, res) => {
-  const { core_start_hour, core_end_hour, drive_out_minutes, drive_return_minutes } = req.body;
+  const { core_start_hour, core_end_hour, drive_out_minutes, drive_return_minutes, holidays, availability } = req.body;
   const entries = { core_start_hour, core_end_hour, drive_out_minutes, drive_return_minutes };
   try {
     for (const [k,v] of Object.entries(entries)) {
       if (v !== undefined) {
         await db.run('INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)',[k,String(v)]);
       }
+    }
+    if (holidays) {
+      await db.run('INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)',['holidays', JSON.stringify(holidays)]);
+    }
+    if (availability) {
+      await db.run('INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)',['availability', JSON.stringify(availability)]);
     }
     res.json({ success:true });
   } catch(e){ res.status(400).json({ error: e.message }); }
@@ -132,20 +145,70 @@ app.get('/api/schedules/:job_number', async (req, res) => {
 
 app.post('/api/schedules', async (req, res) => {
   try {
-    const { job_number, title, start_time, end_time, description, installers, man_hours, override, core_hours_override } = req.body;
+  const { job_number, title, start_time, end_time, description, installers, man_hours, override, core_hours_override, override_availability } = req.body;
+  const rule_overrides = [];
+  if (override) rule_overrides.push('hours_or_overlap');
+  if (override_availability) rule_overrides.push('availability');
+  if (core_hours_override) rule_overrides.push('core_hours');
     let { date } = req.body; // allow mutation for weekend auto-shift
     let original_date = date;
-    let shiftedWeekend = false;
+  let shiftedWeekend = false;
+  let shiftedHoliday = false;
     // Weekend handling: auto-shift to next Monday if weekend and no override flags
     if (date) {
       const d = new Date(date);
       if (!isNaN(d.getTime())) {
         const dow = d.getDay();
-        if ((dow === 0 || dow === 6) && !override && !core_hours_override) {
-          const add = dow === 6 ? 2 : 1; // Sat->Mon +2, Sun->Mon +1
-          d.setDate(d.getDate() + add);
-          date = d.toISOString().slice(0,16); // keep to minute precision
-          shiftedWeekend = true;
+        // Load holidays list
+        const holidaysRow = await db.get('SELECT value FROM settings WHERE key=?',['holidays']);
+        let holidays = [];
+        if (holidaysRow?.value) { try { holidays = JSON.parse(holidaysRow.value); } catch { holidays = []; } }
+        const dateStr = d.toISOString().slice(0,10);
+        const isHoliday = holidays.includes(dateStr);
+        if (((dow === 0 || dow === 6) || isHoliday) && !override && !core_hours_override) {
+          // Move forward to next non-weekend, non-holiday weekday
+          while (true) {
+            const dow2 = d.getDay();
+            const ds = d.toISOString().slice(0,10);
+            const holidayNow = holidays.includes(ds);
+            if (dow2 !== 0 && dow2 !== 6 && !holidayNow) break;
+            d.setDate(d.getDate() + 1);
+          }
+          date = d.toISOString().slice(0,16);
+          if (dow === 0 || dow === 6) shiftedWeekend = true; else shiftedHoliday = true;
+        }
+      }
+    }
+    // Availability enforcement (before hour limit/overlap) unless overridden
+    if (Array.isArray(installers) && installers.length && man_hours && !(override || override_availability)) {
+      const availabilityRow = await db.get('SELECT value FROM settings WHERE key=?',[ 'availability' ]);
+      let availability = {};
+      if (availabilityRow?.value) { try { availability = JSON.parse(availabilityRow.value); } catch { availability = {}; } }
+      const dayStr = date.slice(0,10);
+      // derive working hours span (approx) for first day only
+      const coreStartRow = await db.get('SELECT value FROM settings WHERE key=?',[ 'core_start_hour' ]);
+      const coreEndRow = await db.get('SELECT value FROM settings WHERE key=?',[ 'core_end_hour' ]);
+      const coreStart = Number(coreStartRow?.value || 8);
+      const coreEnd = Number(coreEndRow?.value || 16);
+      const startDateObj = new Date(date);
+      const startHour = isNaN(startDateObj.getTime()) ? coreStart : startDateObj.getHours();
+      const perInstallerHours = Number(man_hours) / installers.length;
+      const hoursSpan = [];
+      // Collect each whole hour touched on the start day only
+      for(let h=0; h < perInstallerHours && (startHour + h) < 24; h++) {
+        hoursSpan.push(startHour + h);
+      }
+      for (const instId of installers) {
+        const instAvail = (availability[instId]||{})[dayStr];
+        if (!instAvail) continue; // no record => available
+        if (instAvail.out) {
+          return res.status(400).json({ error: 'Installer unavailable (out all day). Use availability override to allow.' });
+        }
+        if (Array.isArray(instAvail.outHours)) {
+          const conflict = hoursSpan.some(h => instAvail.outHours.includes(h));
+          if (conflict) {
+            return res.status(400).json({ error: 'Installer unavailable (hour conflict). Use availability override to allow.' });
+          }
         }
       }
     }
@@ -194,28 +257,78 @@ app.post('/api/schedules', async (req, res) => {
         await db.run('INSERT INTO schedule_installers (schedule_id, installer_id) VALUES (?, ?)', [schedule_id, installer_id]);
       }
     }
-  res.json({ id: schedule_id, job_number, title, date, start_time, end_time, description, installers, man_hours, shiftedWeekend, original_date: shiftedWeekend ? original_date : undefined });
+  res.json({ id: schedule_id, job_number, title, date, start_time, end_time, description, installers, man_hours, shiftedWeekend, shiftedHoliday, original_date: (shiftedWeekend||shiftedHoliday) ? original_date : undefined, rule_overrides });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
 });
 // PATCH endpoint to update description, man_hours, installers, address, etc.
 app.patch('/api/schedules/:id', async (req, res) => {
-  let { description, man_hours, date, start_time, end_time, installers, address, override, core_hours_override } = req.body;
+  let { description, man_hours, date, start_time, end_time, installers, address, override, core_hours_override, override_availability } = req.body;
+  const rule_overrides = [];
+  if (override) rule_overrides.push('hours_or_overlap');
+  if (override_availability) rule_overrides.push('availability');
+  if (core_hours_override) rule_overrides.push('core_hours');
   const { id } = req.params;
   try {
     // Weekend handling on update: auto-shift to next Monday if setting to weekend and no override flags
     let original_date = date;
-    let shiftedWeekend = false;
+  let shiftedWeekend = false;
+  let shiftedHoliday = false;
     if (date) {
       const d = new Date(date);
       if (!isNaN(d.getTime())) {
         const dow = d.getDay();
-        if ((dow === 0 || dow === 6) && !override && !core_hours_override) {
-          const add = dow === 6 ? 2 : 1;
-          d.setDate(d.getDate() + add);
-          date = d.toISOString().slice(0,16);
-          shiftedWeekend = true;
+        const holidaysRow = await db.get('SELECT value FROM settings WHERE key=?',['holidays']);
+        let holidays = [];
+        if (holidaysRow?.value) { try { holidays = JSON.parse(holidaysRow.value); } catch { holidays = []; } }
+        const dateStr = d.toISOString().slice(0,10);
+        const isHoliday = holidays.includes(dateStr);
+        if (((dow === 0 || dow === 6) || isHoliday) && !override && !core_hours_override) {
+          while (true) {
+            const dow2 = d.getDay();
+            const ds = d.toISOString().slice(0,10);
+            const holidayNow = holidays.includes(ds);
+            if (dow2 !== 0 && dow2 !== 6 && !holidayNow) break;
+            d.setDate(d.getDate() + 1);
+          }
+            date = d.toISOString().slice(0,16);
+            if (dow === 0 || dow === 6) shiftedWeekend = true; else shiftedHoliday = true;
+        }
+      }
+    }
+    // Availability enforcement on update unless overridden
+    if (Array.isArray(installers) && installers.length && man_hours && !(override || override_availability)) {
+      // Determine date
+      let effDate = date;
+      if (!effDate) {
+        const job = await db.get('SELECT date FROM schedules WHERE id = ?', [id]);
+        effDate = job?.date;
+      }
+      if (effDate) {
+        const availabilityRow = await db.get('SELECT value FROM settings WHERE key=?',[ 'availability' ]);
+        let availability = {};
+        if (availabilityRow?.value) { try { availability = JSON.parse(availabilityRow.value); } catch { availability = {}; } }
+        const dayStr = effDate.slice(0,10);
+        const coreStartRow = await db.get('SELECT value FROM settings WHERE key=?',[ 'core_start_hour' ]);
+        const coreStart = Number(coreStartRow?.value || 8);
+        const startDateObj = new Date(effDate);
+        const startHour = isNaN(startDateObj.getTime()) ? coreStart : startDateObj.getHours();
+        const perInstallerHours = Number(man_hours) / installers.length;
+        const hoursSpan = [];
+        for(let h=0; h < perInstallerHours && (startHour + h) < 24; h++) hoursSpan.push(startHour + h);
+        for (const instId of installers) {
+          const instAvail = (availability[instId]||{})[dayStr];
+          if (!instAvail) continue;
+          if (instAvail.out) {
+            return res.status(400).json({ error: 'Installer unavailable (out all day). Use availability override to allow.' });
+          }
+          if (Array.isArray(instAvail.outHours)) {
+            const conflict = hoursSpan.some(h => instAvail.outHours.includes(h));
+            if (conflict) {
+              return res.status(400).json({ error: 'Installer unavailable (hour conflict). Use availability override to allow.' });
+            }
+          }
         }
       }
     }
@@ -294,7 +407,7 @@ app.patch('/api/schedules/:id', async (req, res) => {
     const updated = await db.get('SELECT * FROM schedules WHERE id = ?', [id]);
     const updatedInstallers = await db.all('SELECT installer_id FROM schedule_installers WHERE schedule_id = ?', [id]);
     updated.installers = updatedInstallers.map(i => i.installer_id);
-  res.json({ ...updated, shiftedWeekend, original_date: shiftedWeekend ? original_date : undefined });
+  res.json({ ...updated, shiftedWeekend, shiftedHoliday, original_date: (shiftedWeekend||shiftedHoliday) ? original_date : undefined, rule_overrides });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }

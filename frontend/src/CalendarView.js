@@ -8,6 +8,15 @@ import { getDrivingTimeMinutes } from './drivingTime';
 
 const locales = { 'en-US': require('date-fns/locale/en-US') };
 const localizer = dateFnsLocalizer({ format, parse, startOfWeek: () => startOfWeek(new Date(), { weekStartsOn: 0 }), getDay, locales });
+// Helper: format a Date into local YYYY-MM-DDTHH:MM (avoids UTC shift from toISOString)
+function formatLocalDateTime(dt) {
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth()+1).padStart(2,'0');
+  const d = String(dt.getDate()).padStart(2,'0');
+  const hh = String(dt.getHours()).padStart(2,'0');
+  const mm = String(dt.getMinutes()).padStart(2,'0');
+  return `${y}-${m}-${d}T${hh}:${mm}`;
+}
 
 // Deterministic color per job number / id
 function colorForJob(job) {
@@ -33,14 +42,17 @@ const coreSpan = () => Math.max(0, CORE_END_HOUR - CORE_START_HOUR);
 // If total (driveOut + driveReturn) >= core span, that day yields no workable hours and we skip to next day.
 async function buildEvents(job, homeBase, settings) {
   let startInput = job.date || job.start || job['Promise Date'] || job['Date Setup'];
-  if (typeof startInput === 'string' && /\d{4}-\d{2}-\d{2}$/.test(startInput)) startInput += 'T08:00:00';
+    if (typeof startInput === 'string' && /\d{4}-\d{2}-\d{2}$/.test(startInput)) startInput += 'T08:00:00'; 
+    const holidays = Array.isArray(schedSettings?.holidays) ? schedSettings.holidays : [];
+    const dayStr = d.toISOString().slice(0,10);
+    const isWeekend = d.getDay()===0 || d.getDay()===6 || holidays.includes(dayStr);
   let baseStart = new Date(startInput);
   if (isNaN(baseStart.getTime())) baseStart = new Date();
 
   // Number of installers affects per-installer hours length for visualization
   const nInstallers = (Array.isArray(job.installers) && job.installers.length) ? job.installers.length : 1;
-  const totalManHours = Number(job.man_hours) || 0;
-  const perInstallerHours = totalManHours / nInstallers || 0;
+  const totalManHours = Number(job.man_hours) || 0; // aggregate man-hours (sum across installers)
+  const clockHoursTotal = nInstallers ? totalManHours / nInstallers : totalManHours; // elapsed wall time
 
   // If override: single continuous event starting at (baseStart + drive outbound)
   let driveMinutesOut = 0;
@@ -56,7 +68,7 @@ async function buildEvents(job, homeBase, settings) {
 
   if (job.core_hours_override) {
     const start = new Date(baseStart.getTime() + driveMinutesOut * 60000);
-    const end = new Date(start.getTime() + perInstallerHours * 3600000);
+    const end = new Date(start.getTime() + clockHoursTotal * 3600000);
     const color = colorForJob(job);
     return [{
       id: `${job.id}-0`,
@@ -68,14 +80,15 @@ async function buildEvents(job, homeBase, settings) {
       color,
   partIndex: 1,
   partsTotal: 1,
-  partHours: perInstallerHours,
+  partHours: clockHoursTotal,
   remainingHours: 0,
+  clockHoursTotal,
       resource: job
     }];
   }
 
   // Split into multiple days inside core hours window, accounting for travel each day (both outbound + return).
-  let remaining = perInstallerHours;
+  let remaining = clockHoursTotal; // remaining clock (elapsed) hours
   const events = [];
   let dayIndex = 0;
   // Align baseStart to at least core start hour for its day if earlier than core start; if later (user chose later), keep it.
@@ -87,7 +100,8 @@ async function buildEvents(job, homeBase, settings) {
   while (remaining > 0 && dayIndex < 100) { // safety cap
     const currentDay = new Date(day0.getTime() + dayIndex * 24 * 3600000);
     const dow = currentDay.getDay();
-    const isWeekend = (dow === 0 || dow === 6);
+  const dayStrInner = curr.toISOString().slice(0,10);
+  const isWeekend = curr.getDay()===0 || curr.getDay()===6 || holidays.includes(dayStrInner);
     const dayAnchor = new Date(currentDay); // baseline 00:00 of that day
     let windowStart = new Date(dayAnchor);
     let windowEnd = new Date(dayAnchor);
@@ -131,11 +145,12 @@ async function buildEvents(job, homeBase, settings) {
       start: shiftedStart,
       end: eventEnd,
       jobLabel: `${job.job_number || ''} ${job.description || ''}`.trim(),
-      manHours: totalManHours,
+  manHours: totalManHours,
       color: colorForJob(job),
   partHours: hoursThisDay,
       travelOutMinutes: driveMinutesOut,
       travelReturnMinutes: driveMinutesReturn,
+  clockHoursTotal,
   resource: job,
   nonCore: isWeekend
     });
@@ -149,9 +164,11 @@ async function buildEvents(job, homeBase, settings) {
     events.forEach((ev, idx) => {
       ev.partIndex = idx + 1;
       ev.partsTotal = events.length;
-      accrued += ev.partHours;
-      const remaining = Math.max(0, totalManHours - accrued);
-      ev.remainingHours = Number(remaining.toFixed(2));
+  accrued += ev.partHours; // accrued clock hours
+  // Convert accrued clock -> equivalent man-hours consumed = accrued * nInstallers
+  const consumedManHours = accrued * nInstallers;
+  const remainingMan = Math.max(0, totalManHours - consumedManHours);
+  ev.remainingHours = Number(remainingMan.toFixed(2));
       ev.title = `${job.description || job.job_number} (Part ${ev.partIndex}/${events.length})`;
     });
   } else if (events.length === 1) {
@@ -174,6 +191,7 @@ export default function CalendarView() {
   const [loading, setLoading] = useState({ installers: false, homeBase: false, schedules: false, settings:false });
   const [error, setError] = useState(null);
   const [overrideDailyLimit, setOverrideDailyLimit] = useState(false);
+  const [overrideAvailability, setOverrideAvailability] = useState(false);
   const [inlineEdit, setInlineEdit] = useState({ id: null, desc: '', mh: '', installers: [], loading: false, error: null });
   const [currentView, setCurrentView] = useState('month');
   const [currentDate, setCurrentDate] = useState(new Date());
@@ -280,6 +298,8 @@ export default function CalendarView() {
   function handleSelectSlot(slot) {
     const d = slot.start instanceof Date ? slot.start : new Date(slot.start);
     setForm(f => ({ ...f, date: d.toISOString().slice(0,16) }));
+  // Store as local wall time string (was using UTC toISOString causing hour jumps)
+  setForm(f => ({ ...f, date: formatLocalDateTime(d) }));
     setShowForm(true);
   }
   function handleChange(e) {
@@ -299,20 +319,37 @@ export default function CalendarView() {
     return d.toISOString().slice(0,10);
   }
   function getInstallerAssignedHours(installerId, dateStr) {
+    // Returns already-assigned "per-installer" hours (clock hours *not* total man-hours) for that day
     if (!dateStr) return 0;
     return events.filter(ev => {
       const evDay = getDayString(ev.start);
       return evDay === dateStr && Array.isArray(ev.resource?.installers) && ev.resource.installers.includes(installerId);
-    }).reduce((sum, ev) => sum + (Number(ev.partHours) || 0), 0);
+    }).reduce((sum, ev) => {
+      const installersCnt = (ev.resource?.installers?.length) || 1;
+      // Each slice's elapsed hours = ev.partHours. Per installer consumption that day for this slice = ev.partHours (clock)
+      // We compare against 8 clock hours per installer, so add ev.partHours directly.
+      return sum + (Number(ev.partHours) || 0);
+    }, 0);
   }
   function wouldExceedLimit(installerIds, dateStr, totalManHours) {
     if (!dateStr || !totalManHours || !installerIds.length) return false;
-    const perInstallerAdd = Number(totalManHours) / installerIds.length;
-    return installerIds.some(id => getInstallerAssignedHours(id, dateStr.slice(0,10)) + perInstallerAdd > 8.0001);
+    // New job per-installer clock hours = totalManHours / installerCount
+    const perInstallerClockAdd = Number(totalManHours) / installerIds.length; // man-hours divided by installers = clock hours per installer
+    return installerIds.some(id => getInstallerAssignedHours(id, dateStr.slice(0,10)) + perInstallerClockAdd > 8.0001);
   }
   const exceed = wouldExceedLimit(form.installers, form.date, form.man_hours);
   const isWeekend = (()=>{ if(!form.date) return false; const d=new Date(form.date); const g=d.getDay(); return g===0||g===6; })();
   const weekendBlocked = isWeekend && !form.core_hours_override;
+  const holidays = Array.isArray(schedSettings?.holidays) ? schedSettings.holidays : [];
+  const availability = schedSettings?.availability || {};
+  const dateDayStr = form.date ? form.date.slice(0,10) : '';
+  const isHoliday = dateDayStr && holidays.includes(dateDayStr);
+  const availabilityBlocked = (() => {
+    if (!dateDayStr || !form.installers.length) return false;
+    const dayAvail = availability[dateDayStr] || {};
+    // If any selected installer marked out all day -> blocked
+    return form.installers.some(id => dayAvail[id]?.out === true);
+  })();
   function detectOverlap(startISO, manHours, installerIds, excludeJobId){
     if(!startISO || !manHours || !installerIds || !installerIds.length) return false;
     const start = new Date(startISO);
@@ -328,18 +365,47 @@ export default function CalendarView() {
       return ev.start < end && start < ev.end;
     });
   }
+  // Availability conflict: use schedSettings.availability { date: { installerId: { out: bool, outHours:[hour] } } }
+  function availabilityConflict(startISO, manHours, installerIds) {
+    if (!schedSettings || !startISO || !installerIds?.length || !manHours) return false;
+    const avail = schedSettings.availability || {};
+    const d = new Date(startISO);
+    if (isNaN(d.getTime())) return false;
+    const dayStr = startISO.slice(0,10);
+    const dayAvail = avail[dayStr] || {};
+    const perClock = Number(manHours)/(installerIds.length||1); // elapsed hours
+    const startHour = d.getHours() + d.getMinutes()/60;
+    // Only check hours on first day (multi-day continuation allowed later)
+    const endHour = startHour + perClock;
+    return installerIds.some(id => {
+      const rec = dayAvail[id];
+      if (!rec) return false;
+      if (rec.out) return true;
+      if (Array.isArray(rec.outHours) && rec.outHours.length) {
+        const blocked = rec.outHours.some(h => h >= Math.floor(startHour) && h < endHour); // hour integer within range
+        if (blocked) return true;
+      }
+      return false;
+    });
+  }
   const overlapConflict = detectOverlap(form.date, form.man_hours, form.installers);
+  const availabilityPartialConflict = availabilityConflict(form.date, form.man_hours, form.installers);
   async function submit(e) {
     e.preventDefault();
-  if (weekendBlocked) { return; }
+  if (weekendBlocked || (isHoliday && !form.core_hours_override)) { return; }
+  if ((availabilityBlocked || availabilityPartialConflict) && !(overrideDailyLimit || overrideAvailability)) { setError('Selected installer is out (availability)'); return; }
   if (overlapConflict && !overrideDailyLimit) { setError('Overlap with existing assignment (enable override)'); return; }
     try {
-      const payload = { ...form, title: form.description || form.job_number, override: overrideDailyLimit };
+  const payload = { ...form, title: form.description || form.job_number, override: overrideDailyLimit, override_availability: overrideAvailability };
       const res = await fetch('/api/schedules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error || `Create failed (${res.status})`);
-      if (body.shiftedWeekend) {
-        setToast({ message: `Weekend date auto-shifted to Monday (${body.original_date?.slice(0,10)} → ${body.date?.slice(0,10)})`, ts: Date.now() });
+      if (body.shiftedWeekend || body.shiftedHoliday) {
+        const kind = body.shiftedWeekend ? 'Weekend' : 'Holiday';
+        setToast({ message: `${kind} date auto-shifted to next business day (${body.original_date?.slice(0,10)} → ${body.date?.slice(0,10)})`, ts: Date.now() });
+      }
+      if (Array.isArray(body.rule_overrides) && body.rule_overrides.length) {
+        setToast({ message: `Created with overrides: ${body.rule_overrides.join(', ')}`, ts: Date.now() });
       }
     } catch (e) {
       setError(e.message);
@@ -388,12 +454,16 @@ export default function CalendarView() {
   async function saveEdit() {
     if (!selected) return;
     try {
-      const payload = { description: form.description, man_hours: form.man_hours, date: form.date, address: form.address, installers: form.installers, override: overrideDailyLimit };
+  const payload = { description: form.description, man_hours: form.man_hours, date: form.date, address: form.address, installers: form.installers, override: overrideDailyLimit, override_availability: overrideAvailability };
       const res = await fetch(`/api/schedules/${selected.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       const body = await res.json().catch(()=>({}));
       if (!res.ok) throw new Error(body.error || `Update failed (${res.status})`);
-      if (body.shiftedWeekend) {
-        setToast({ message: `Weekend date auto-shifted to Monday (${body.original_date?.slice(0,10)} → ${body.date?.slice(0,10)})`, ts: Date.now() });
+      if (body.shiftedWeekend || body.shiftedHoliday) {
+        const kind = body.shiftedWeekend ? 'Weekend' : 'Holiday';
+        setToast({ message: `${kind} date auto-shifted to next business day (${body.original_date?.slice(0,10)} → ${body.date?.slice(0,10)})`, ts: Date.now() });
+      }
+      if (Array.isArray(body.rule_overrides) && body.rule_overrides.length) {
+        setToast({ message: `Updated with overrides: ${body.rule_overrides.join(', ')}`, ts: Date.now() });
       }
       setEditing(false);
       setSelected(null);
@@ -424,8 +494,10 @@ export default function CalendarView() {
     const originalInstallers = job.installers || [];
     const perNew = newManHours / newInstallerIds.length;
     return newInstallerIds.some(installerId => {
-      const currentAssigned = getInstallerAssignedHours(installerId, dateStr) - (originalInstallers.includes(installerId) && originalInstallers.length ? (originalMH / originalInstallers.length) : 0);
-      return currentAssigned + perNew > 8.0001;
+  // Remove original job's per-installer clock hours if this installer had it
+  const originalPerInstallerClock = (originalInstallers.includes(installerId) && originalInstallers.length) ? (originalMH / originalInstallers.length) : 0;
+  const currentAssigned = getInstallerAssignedHours(installerId, dateStr) - originalPerInstallerClock;
+  return currentAssigned + perNew > 8.0001; // compare in clock hours
     });
   }
   async function saveInlineEdit(job) {
@@ -445,14 +517,22 @@ export default function CalendarView() {
         setInlineEdit(ie => ({ ...ie, loading:false, error: 'Time overlap (enable override)' }));
         return;
       }
+      if (availabilityConflict(potentialISO, newMH, newInstallers)) {
+        setInlineEdit(ie => ({ ...ie, loading:false, error: 'Installer out (availability)' }));
+        return;
+      }
     }
     try {
-      const payload = { description: inlineEdit.desc, man_hours: inlineEdit.mh, installers: newInstallers, override: overrideDailyLimit };
+  const payload = { description: inlineEdit.desc, man_hours: inlineEdit.mh, installers: newInstallers, override: overrideDailyLimit, override_availability: overrideAvailability };
       const res = await fetch(`/api/schedules/${job.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       const body = await res.json().catch(()=>({}));
       if (!res.ok) throw new Error(body.error || `Update failed (${res.status})`);
-      if (body.shiftedWeekend) {
-        setToast({ message: `Weekend date auto-shifted to Monday (${body.original_date?.slice(0,10)} → ${body.date?.slice(0,10)})`, ts: Date.now() });
+      if (body.shiftedWeekend || body.shiftedHoliday) {
+        const kind = body.shiftedWeekend ? 'Weekend' : 'Holiday';
+        setToast({ message: `${kind} date auto-shifted to next business day (${body.original_date?.slice(0,10)} → ${body.date?.slice(0,10)})`, ts: Date.now() });
+      }
+      if (Array.isArray(body.rule_overrides) && body.rule_overrides.length) {
+        setToast({ message: `Inline saved with overrides: ${body.rule_overrides.join(', ')}`, ts: Date.now() });
       }
       cancelInlineEdit();
       loadSchedules();
@@ -491,7 +571,7 @@ export default function CalendarView() {
       newStart.setDate(newStart.getDate()+1);
       newStart.setHours(CORE_START_HOUR,0,0,0);
     }
-    const iso = newStart.toISOString().slice(0,16);
+  const iso = formatLocalDateTime(newStart);
     if (newStart.getTime() !== newStartRaw.getTime()) {
       setToast({ message: 'Dragged outside core hours: snapped to next core window.', ts: Date.now() });
     }
@@ -505,6 +585,10 @@ export default function CalendarView() {
       setToast({ message: 'Move blocked: overlapping assignment (enable override to force).', ts: Date.now() });
       return; // do not persist
     }
+    if (!overrideDailyLimit && availabilityConflict(iso, job.man_hours, job.installers)) {
+      setToast({ message: 'Move blocked: installer availability (out).', ts: Date.now() });
+      return;
+    }
     // Simulate slices to preview if multi-day result
     try {
       const simulated = await buildEvents({ ...job, date: iso, core_hours_override: job.core_hours_override }, homeBase, schedSettings);
@@ -512,11 +596,15 @@ export default function CalendarView() {
       if (multi) {
         if (skipMultiDayConfirm) {
           // Directly commit without modal
-          const payload = { date: iso, override: overrideDailyLimit };
+          const payload = { date: iso, override: overrideDailyLimit, override_availability: overrideAvailability };
           const res = await fetch(`/api/schedules/${job.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
           if (!res.ok) {
             const body = await res.json().catch(()=>({}));
             throw new Error(body.error || `Move failed (${res.status})`);
+          }
+          const moved = await res.json().catch(()=>({}));
+          if (Array.isArray(moved.rule_overrides) && moved.rule_overrides.length) {
+            setToast({ message: `Moved with overrides: ${moved.rule_overrides.join(', ')}`, ts: Date.now() });
           }
           loadSchedules();
         } else {
@@ -525,11 +613,15 @@ export default function CalendarView() {
         }
       }
       // Single slice -> proceed immediately
-      const payload = { date: iso, override: overrideDailyLimit };
+  const payload = { date: iso, override: overrideDailyLimit, override_availability: overrideAvailability };
       const res = await fetch(`/api/schedules/${job.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       if (!res.ok) {
         const body = await res.json().catch(()=>({}));
         throw new Error(body.error || `Move failed (${res.status})`);
+      }
+      const movedSingle = await res.json().catch(()=>({}));
+      if (Array.isArray(movedSingle.rule_overrides) && movedSingle.rule_overrides.length) {
+        setToast({ message: `Moved with overrides: ${movedSingle.rule_overrides.join(', ')}`, ts: Date.now() });
       }
       loadSchedules();
     } catch(e){ setError(e.message); }
@@ -543,17 +635,25 @@ export default function CalendarView() {
     // Multiply by installer count to get total man_hours (approx). If multi-part originally, this is a direct edit.
     const installerCount = Array.isArray(job.installers) && job.installers.length ? job.installers.length : 1;
     const newTotal = (hours * installerCount).toFixed(2);
-    const startISO = new Date(start).toISOString().slice(0,16);
+  const startISO = formatLocalDateTime(new Date(start));
     if (!overrideDailyLimit && detectOverlap(startISO, newTotal, job.installers, job.id)) {
       setToast({ message: 'Resize blocked: overlapping assignment (enable override to force).', ts: Date.now() });
       return;
     }
+    if (!overrideDailyLimit && availabilityConflict(startISO, newTotal, job.installers)) {
+      setToast({ message: 'Resize blocked: installer availability (out).', ts: Date.now() });
+      return;
+    }
     try {
-      const payload = { man_hours: newTotal, override: overrideDailyLimit };
+  const payload = { man_hours: newTotal, override: overrideDailyLimit, override_availability: overrideAvailability };
       const res = await fetch(`/api/schedules/${job.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       if (!res.ok) {
         const body = await res.json().catch(()=>({}));
         throw new Error(body.error || `Resize failed (${res.status})`);
+      }
+      const resized = await res.json().catch(()=>({}));
+      if (Array.isArray(resized.rule_overrides) && resized.rule_overrides.length) {
+        setToast({ message: `Resized with overrides: ${resized.rule_overrides.join(', ')}`, ts: Date.now() });
       }
       loadSchedules();
     } catch(e){ setError(e.message); }
@@ -587,11 +687,15 @@ export default function CalendarView() {
               <button onClick={()=>setMovePreview(null)}>Cancel</button>
               <button onClick={async ()=>{
                 try {
-                  const payload = { date: movePreview.iso, override: overrideDailyLimit };
+                  const payload = { date: movePreview.iso, override: overrideDailyLimit, override_availability: overrideAvailability };
                   const res = await fetch(`/api/schedules/${movePreview.job.id}`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
                   if (!res.ok) {
                     const body = await res.json().catch(()=>({}));
                     throw new Error(body.error || `Move failed (${res.status})`);
+                  }
+                  const mv = await res.json().catch(()=>({}));
+                  if (Array.isArray(mv.rule_overrides) && mv.rule_overrides.length) {
+                    setToast({ message: `Moved with overrides: ${mv.rule_overrides.join(', ')}`, ts: Date.now() });
                   }
                   setMovePreview(null);
                   loadSchedules();
@@ -698,6 +802,9 @@ export default function CalendarView() {
                     <label style={{ fontSize:9, display:'flex', alignItems:'center', gap:2 }} title="Override 8h limit">
                       <input type="checkbox" checked={overrideDailyLimit} onChange={e=>setOverrideDailyLimit(e.target.checked)} />Ovr
                     </label>
+                    <label style={{ fontSize:9, display:'flex', alignItems:'center', gap:2 }} title="Override availability">
+                      <input type="checkbox" checked={overrideAvailability} onChange={e=>setOverrideAvailability(e.target.checked)} />Avail
+                    </label>
                     <button type="button" disabled={inlineEdit.loading} onClick={()=>saveInlineEdit(job)} style={{ fontSize:9 }}>Save</button>
                     <button type="button" disabled={inlineEdit.loading} onClick={cancelInlineEdit} style={{ fontSize:9 }}>X</button>
                   </div>
@@ -706,7 +813,9 @@ export default function CalendarView() {
                 </div>
               );
             }
-            const partsInfo = event.partsTotal > 1 ? `Part ${event.partIndex}/${event.partsTotal} | Slice ${event.partHours}h | Remaining ${event.remainingHours}h of ${event.manHours}h` : `${event.manHours}h total`;
+            const partsInfo = event.partsTotal > 1
+              ? `Part ${event.partIndex}/${event.partsTotal} | Slice ${event.partHours} clock h | Remaining ${event.remainingHours} man-h of ${event.manHours} man-h (total clock ${event.clockHoursTotal}h)`
+              : `${event.manHours} man-h (clock ${event.clockHoursTotal}h)`;
       const travelInfo = (event.travelOutMinutes || event.travelReturnMinutes) ? `Travel Out: ${event.travelOutMinutes||0}m | Return: ${event.travelReturnMinutes||0}m` : '';
       const tooltip = `${event.jobLabel} \n${partsInfo}${travelInfo?`\n${travelInfo}`:''}`;
             return (
@@ -735,6 +844,34 @@ export default function CalendarView() {
             boxShadow: event.nonCore ? 'inset 0 0 0 2px rgba(255,255,255,0.15)' : undefined
           };
           return { style };
+        }}
+        dayPropGetter={(date)=>{
+          const holidays = Array.isArray(schedSettings?.holidays) ? schedSettings.holidays : [];
+          const ds = date.toISOString().slice(0,10);
+          if (holidays.includes(ds)) {
+            return { style: { backgroundColor: '#fff2f2' } };
+          }
+          return {};
+        }}
+        slotPropGetter={(date)=>{
+          try {
+            if(!schedSettings || !schedSettings.availability || !Array.isArray(selectedInstallers) || selectedInstallers.length===0) return {};
+            const day = date.toISOString().slice(0,10);
+            const hour = date.getHours();
+            const allOut = selectedInstallers.every(instId=>{
+              const instAvailDay = (schedSettings.availability[instId]||{})[day];
+              if(!instAvailDay) return false; // no record means available
+              if(instAvailDay.out) return true;
+              if(instAvailDay.outHours && Array.isArray(instAvailDay.outHours)) return instAvailDay.outHours.includes(hour);
+              return false;
+            });
+            if(allOut){
+              return { style: { backgroundColor: '#ffe9e9' } };
+            }
+            return {};
+          } catch(err){
+            return {};
+          }
         }}
       />
       {/* Daily hours summary sidebar - only in Day view, draggable */}
@@ -823,9 +960,10 @@ export default function CalendarView() {
                           const dayStr = form.date ? form.date.slice(0,10):'';
                           const assigned = getInstallerAssignedHours(i.id, dayStr);
                           const candidateIds = form.installers.includes(i.id) ? form.installers : [...form.installers, i.id];
-                          const perInstallerAdd = form.man_hours && candidateIds.length ? Number(form.man_hours)/candidateIds.length : 0;
-                          const wouldExceed = assigned + perInstallerAdd > 8.0001;
-                          const disabled = !overrideDailyLimit && !form.installers.includes(i.id) && wouldExceed;
+                          const perInstallerClock = form.man_hours && candidateIds.length ? Number(form.man_hours)/candidateIds.length : 0; // elapsed per installer
+                          const wouldExceed = assigned + perInstallerClock > 8.0001;
+                          // Allow choosing an installer with zero current hours even if job >8 man-hours (will span multiple days). Disable only if existing hours cause exceedance.
+                          const disabled = !overrideDailyLimit && !form.installers.includes(i.id) && wouldExceed && assigned > 0;
                           return <option key={i.id} value={i.id} disabled={disabled}>{i.name} {assigned?`(${assigned.toFixed(1)}h)`:''}{disabled?' (limit)':''}</option>;
                         })}
                       </select>
@@ -893,9 +1031,9 @@ export default function CalendarView() {
                         const dayStr = form.date ? form.date.slice(0,10) : '';
                         const assigned = getInstallerAssignedHours(i.id, dayStr);
                         const candidateIds = form.installers.includes(i.id) ? form.installers : [...form.installers, i.id];
-                        const perInstallerAdd = form.man_hours && candidateIds.length ? Number(form.man_hours) / candidateIds.length : 0;
-                        const wouldExceed = assigned + perInstallerAdd > 8.0001;
-                        const disabled = !overrideDailyLimit && !form.installers.includes(i.id) && wouldExceed;
+                        const perInstallerClock = form.man_hours && candidateIds.length ? Number(form.man_hours) / candidateIds.length : 0;
+                        const wouldExceed = assigned + perInstallerClock > 8.0001;
+                        const disabled = !overrideDailyLimit && !form.installers.includes(i.id) && wouldExceed && assigned > 0;
                         return (
                           <option key={i.id} value={i.id} disabled={disabled}>
                             {i.name} {assigned ? `(${assigned.toFixed(1)}h)` : ''}{disabled ? ' (limit)' : ''}
@@ -916,14 +1054,24 @@ export default function CalendarView() {
                       Per-installer hours would exceed 8h. Adjust inputs or override.
                     </div>
                   )}
-                  {weekendBlocked && (
+                  {(weekendBlocked || (isHoliday && !form.core_hours_override)) && (
                     <div style={{ background:'#fdecea', border:'1px solid #f5c2c0', color:'#b71c1c', padding:'6px 8px', borderRadius:4, fontSize:12, marginBottom:6 }}>
-                      Weekend date requires outside core hours override.
+                      {(isHoliday? 'Holiday':'Weekend')} date requires outside core hours override.
                     </div>
                   )}
-                  <label style={{ cursor: 'pointer' }}>
-                    <input type="checkbox" checked={overrideDailyLimit} onChange={e => setOverrideDailyLimit(e.target.checked)} style={{ marginRight: 6 }} /> Override 8h daily limit
-                  </label>
+                    {(availabilityBlocked || availabilityPartialConflict) && !(overrideDailyLimit || overrideAvailability) && (
+                    <div style={{ background:'#fff3cd', border:'1px solid #ffeeba', color:'#856404', padding:'6px 8px', borderRadius:4, fontSize:12, marginBottom:6 }}>
+                      One or more selected installers are marked out.
+                    </div>
+                  )}
+                  <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+                    <label style={{ cursor: 'pointer' }}>
+                      <input type="checkbox" checked={overrideDailyLimit} onChange={e => setOverrideDailyLimit(e.target.checked)} style={{ marginRight: 6 }} /> Override 8h daily limit
+                    </label>
+                    <label style={{ cursor: 'pointer' }}>
+                      <input type="checkbox" checked={overrideAvailability} onChange={e => setOverrideAvailability(e.target.checked)} style={{ marginRight: 6 }} /> Override availability
+                    </label>
+                  </div>
                 </div>
                 <div style={{ textAlign: 'right' }}>
                   <button type="submit" disabled={(exceed && !overrideDailyLimit) || weekendBlocked || (overlapConflict && !overrideDailyLimit)}>Save</button>

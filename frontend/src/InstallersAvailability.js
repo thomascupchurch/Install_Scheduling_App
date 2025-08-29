@@ -21,8 +21,9 @@ function getNextWeekdays(n) {
 
 export default function InstallersAvailability() {
   const [installers, setInstallers] = useState([]);
-  const [availability, setAvailability] = useState({}); // {date: {installer: {out: bool, outHours: [h,h]}}}
+  const [availability, setAvailability] = useState({}); // {date: {installerId: {out: bool, outHours: [hour,...]}}}
   const [holidays, setHolidays] = useState([]); // [date]
+  const [saving, setSaving] = useState(false);
   const { coreStart, coreEnd } = useCoreHours();
   const coreStartNum = Number(coreStart.split(':')[0]);
   const coreEndNum = Number(coreEnd.split(':')[0]);
@@ -33,7 +34,25 @@ export default function InstallersAvailability() {
     fetch('/api/installers')
       .then(res => res.json())
       .then(data => setInstallers(data));
+    // Load holidays from scheduling settings
+    fetch('/api/settings/scheduling')
+      .then(r=>r.json())
+      .then(data => {
+        if (Array.isArray(data.holidays)) setHolidays(data.holidays);
+        if (data.availability && typeof data.availability === 'object') setAvailability(data.availability);
+      });
   }, []);
+
+  // Debounced save holidays
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setSaving(true);
+      fetch('/api/settings/scheduling', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ holidays, availability }) })
+        .catch(()=>{})
+        .finally(()=> setSaving(false));
+    }, 600);
+    return () => clearTimeout(t);
+  }, [holidays, availability]);
 
   // Toggle out for a whole day
   function toggleOut(date, installerId) {
@@ -62,7 +81,7 @@ export default function InstallersAvailability() {
 
   return (
     <div>
-      <h2>Installers Availability</h2>
+  <h2>Installers Availability {saving && <span style={{ fontSize:12, color:'#666' }}>Saving…</span>}</h2>
       <table border="1" cellPadding={4} style={{ borderCollapse: 'collapse', width: '100%' }}>
         <thead>
           <tr>
