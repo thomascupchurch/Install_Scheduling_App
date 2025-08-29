@@ -53,6 +53,17 @@ let db;
     key TEXT PRIMARY KEY,
     value TEXT
   )`);
+  // Seed defaults if not existing
+  const defaults = [
+    ['core_start_hour', '8'],
+    ['core_end_hour', '16'],
+    ['drive_out_minutes', '0'],
+    ['drive_return_minutes', '0']
+  ];
+  for (const [k,v] of defaults) {
+    const row = await db.get('SELECT 1 FROM settings WHERE key=?',[k]);
+    if (!row) await db.run('INSERT INTO settings (key,value) VALUES (?,?)',[k,v]);
+  }
 })();
 
 // Home base API
@@ -65,6 +76,29 @@ app.post('/api/settings/home_base', async (req, res) => {
   const { home_base } = req.body;
   await db.run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['home_base', home_base]);
   res.json({ success: true });
+});
+
+// Core hours & drive settings
+app.get('/api/settings/scheduling', async (req, res) => {
+  const keys = ['core_start_hour','core_end_hour','drive_out_minutes','drive_return_minutes'];
+  const out = {};
+  for (const k of keys) {
+    const row = await db.get('SELECT value FROM settings WHERE key=?',[k]);
+    out[k] = row ? row.value : null;
+  }
+  res.json(out);
+});
+app.post('/api/settings/scheduling', async (req, res) => {
+  const { core_start_hour, core_end_hour, drive_out_minutes, drive_return_minutes } = req.body;
+  const entries = { core_start_hour, core_end_hour, drive_out_minutes, drive_return_minutes };
+  try {
+    for (const [k,v] of Object.entries(entries)) {
+      if (v !== undefined) {
+        await db.run('INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)',[k,String(v)]);
+      }
+    }
+    res.json({ success:true });
+  } catch(e){ res.status(400).json({ error: e.message }); }
 });
 
 // Update job address

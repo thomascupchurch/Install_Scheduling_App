@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Calendar, dateFnsLocalizer } from 'react-big-calendar';
+import withDragAndDrop from 'react-big-calendar/lib/addons/dragAndDrop';
+import 'react-big-calendar/lib/addons/dragAndDrop/styles.css';
 import 'react-big-calendar/lib/css/react-big-calendar.css';
 import { format, parse, startOfWeek, getDay } from 'date-fns';
 import { getDrivingTimeMinutes } from './drivingTime';
@@ -18,13 +20,18 @@ function colorForJob(job) {
   return `hsl(${hue} ${saturation}% ${lightness}%)`;
 }
 
-// Core hours (modifiable if needed)
-const CORE_START_HOUR = 8; // 08:00
-const CORE_END_HOUR = 16;  // 16:00 (4pm)
-const CORE_SPAN = CORE_END_HOUR - CORE_START_HOUR; // 8 hours
+// Core hours defaults (will be updated from backend settings)
+let CORE_START_HOUR = 8; // 08:00
+let CORE_END_HOUR = 16;  // 16:00 (4pm)
+const coreSpan = () => Math.max(0, CORE_END_HOUR - CORE_START_HOUR);
 
 // Build one or many day-sliced events for a job within core hours unless override is set.
-async function buildEvents(job, homeBase) {
+// Enhancement: For multi-day (non-override) jobs we now deduct BOTH morning outbound drive time (home -> job)
+// and evening return drive time (job -> home) from each day's workable window, effectively:
+//   Work window per day: [08:00 + driveOut, 16:00 - driveReturn]
+// (Assuming symmetric drive times). If user supplies a later custom start time on day 1, that overrides 08:00+driveOut.
+// If total (driveOut + driveReturn) >= core span, that day yields no workable hours and we skip to next day.
+async function buildEvents(job, homeBase, settings) {
   let startInput = job.date || job.start || job['Promise Date'] || job['Date Setup'];
   if (typeof startInput === 'string' && /\d{4}-\d{2}-\d{2}$/.test(startInput)) startInput += 'T08:00:00';
   let baseStart = new Date(startInput);
@@ -35,14 +42,20 @@ async function buildEvents(job, homeBase) {
   const totalManHours = Number(job.man_hours) || 0;
   const perInstallerHours = totalManHours / nInstallers || 0;
 
-  // If override: single continuous event starting at (baseStart + drive)
-  let driveMinutes = 0;
+  // If override: single continuous event starting at (baseStart + drive outbound)
+  let driveMinutesOut = 0;
   if (homeBase && job.address) {
-    try { driveMinutes = await getDrivingTimeMinutes(homeBase, job.address); } catch { driveMinutes = 0; }
+    try { driveMinutesOut = await getDrivingTimeMinutes(homeBase, job.address); } catch { driveMinutesOut = 0; }
+  }
+  // Allow asymmetric drive times from settings (if provided & numeric)
+  let driveMinutesReturn = driveMinutesOut;
+  if (settings) {
+    if (settings.drive_out_minutes !== undefined) driveMinutesOut = Number(settings.drive_out_minutes) || 0;
+    if (settings.drive_return_minutes !== undefined) driveMinutesReturn = Number(settings.drive_return_minutes) || 0;
   }
 
   if (job.core_hours_override) {
-    const start = new Date(baseStart.getTime() + driveMinutes * 60000);
+    const start = new Date(baseStart.getTime() + driveMinutesOut * 60000);
     const end = new Date(start.getTime() + perInstallerHours * 3600000);
     const color = colorForJob(job);
     return [{
@@ -61,7 +74,7 @@ async function buildEvents(job, homeBase) {
     }];
   }
 
-  // Split into multiple days inside core hours window, accounting for travel each day.
+  // Split into multiple days inside core hours window, accounting for travel each day (both outbound + return).
   let remaining = perInstallerHours;
   const events = [];
   let dayIndex = 0;
@@ -73,27 +86,43 @@ async function buildEvents(job, homeBase) {
   // Loop while hours remain
   while (remaining > 0 && dayIndex < 100) { // safety cap
     const currentDay = new Date(day0.getTime() + dayIndex * 24 * 3600000);
-    const workStart = new Date(currentDay);
-    workStart.setHours(CORE_START_HOUR, 0, 0, 0);
-    // Add drive time after 08:00 each day (shifts start later, reducing available window)
-    const travelShiftMs = driveMinutes * 60000;
-    const shiftedStart = new Date(workStart.getTime() + travelShiftMs);
-
-    // If user specified a later time on initial day, honor that if later than shiftedStart
-    if (dayIndex === 0 && baseStart.getTime() > shiftedStart.getTime()) {
-      // Still add drive time if baseStart represents pre-drive time; assume baseStart already user-intended start-of-work -> keep
-      shiftedStart.setTime(baseStart.getTime());
+    const dow = currentDay.getDay();
+    const isWeekend = (dow === 0 || dow === 6);
+    const dayAnchor = new Date(currentDay); // baseline 00:00 of that day
+    let windowStart = new Date(dayAnchor);
+    let windowEnd = new Date(dayAnchor);
+    if (isWeekend) {
+      // Full day (non-core) window for weekend
+      windowStart.setHours(0,0,0,0);
+      windowEnd = new Date(windowStart.getTime() + 24*3600000); // next midnight
+    } else {
+      windowStart.setHours(CORE_START_HOUR, 0, 0, 0);
+      windowEnd.setHours(CORE_END_HOUR, 0, 0, 0);
     }
 
-    const dayEnd = new Date(workStart);
-    dayEnd.setHours(CORE_END_HOUR, 0, 0, 0);
-    const availableHours = (dayEnd.getTime() - shiftedStart.getTime()) / 3600000;
+    // Apply outbound & return drive deductions
+    const shiftedStart = new Date(windowStart.getTime() + driveMinutesOut * 60000);
+    const shiftedEnd = new Date(windowEnd.getTime() - driveMinutesReturn * 60000);
+
+    // If user specified a later start on day 1, respect it (but can't exceed shiftedEnd)
+    if (dayIndex === 0 && baseStart.getTime() > shiftedStart.getTime()) {
+      shiftedStart.setTime(Math.min(baseStart.getTime(), shiftedEnd.getTime()));
+    }
+
+    // If drive times eat entire day, skip
+    if (shiftedEnd.getTime() <= shiftedStart.getTime()) {
+      dayIndex += 1;
+      continue;
+    }
+
+  const availableHours = (shiftedEnd.getTime() - shiftedStart.getTime()) / 3600000;
 
     if (availableHours <= 0) { // No workable window this day (e.g., drive pushes past end)
       dayIndex += 1;
       continue;
     }
-    const hoursThisDay = Math.min(remaining, Math.min(availableHours, CORE_SPAN));
+  const cap = isWeekend ? availableHours : Math.min(availableHours, coreSpan());
+  const hoursThisDay = Math.min(remaining, cap);
     const eventEnd = new Date(shiftedStart.getTime() + hoursThisDay * 3600000);
     events.push({
       id: `${job.id}-${dayIndex}`,
@@ -105,7 +134,10 @@ async function buildEvents(job, homeBase) {
       manHours: totalManHours,
       color: colorForJob(job),
   partHours: hoursThisDay,
-      resource: job
+      travelOutMinutes: driveMinutesOut,
+      travelReturnMinutes: driveMinutesReturn,
+  resource: job,
+  nonCore: isWeekend
     });
     remaining -= hoursThisDay;
     dayIndex += 1;
@@ -139,10 +171,34 @@ export default function CalendarView() {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ job_number: '', date: '', description: '', man_hours: '', installers: [], core_hours_override: false, address: '' });
   const [jobQuery, setJobQuery] = useState('');
-  const [loading, setLoading] = useState({ installers: false, homeBase: false, schedules: false });
+  const [loading, setLoading] = useState({ installers: false, homeBase: false, schedules: false, settings:false });
   const [error, setError] = useState(null);
   const [overrideDailyLimit, setOverrideDailyLimit] = useState(false);
-  const [inlineEdit, setInlineEdit] = useState({ id: null, desc: '', mh: '', loading: false, error: null });
+  const [inlineEdit, setInlineEdit] = useState({ id: null, desc: '', mh: '', installers: [], loading: false, error: null });
+  const [currentView, setCurrentView] = useState('month');
+  const [sidebarState, setSidebarState] = useState(()=>{
+    try { return { dragging:false, offsetX:0, offsetY:0, pinned:true, ...JSON.parse(localStorage.getItem('sidebarState')||'{}') }; } catch { return { dragging:false, x:null, y:null, pinned:true, offsetX:0, offsetY:0 }; }
+  });
+  const [schedSettings, setSchedSettings] = useState(null);
+
+  function startDragSidebar(e){
+    e.preventDefault();
+    setSidebarState(s=>({ ...s, dragging:true, pinned:false, offsetX: e.clientX - (s.x ?? window.innerWidth - 230), offsetY: e.clientY - (s.y ?? 0), x: s.x ?? window.innerWidth - 230, y: s.y ?? 0 }));
+  }
+  React.useEffect(()=>{
+    function onMove(e){
+      setSidebarState(s=> s.dragging ? { ...s, x: e.clientX - s.offsetX, y: Math.max(0, e.clientY - s.offsetY) } : s);
+    }
+    function onUp(){ setSidebarState(s=> s.dragging ? { ...s, dragging:false } : s); }
+    if (sidebarState.dragging){
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', onUp);
+    }
+    return ()=>{
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [sidebarState.dragging]);
 
   // Fetch helpers with error handling
   const loadInstallers = async () => {
@@ -177,7 +233,7 @@ export default function CalendarView() {
       const r = await fetch('/api/schedules');
       if (!r.ok) throw new Error(`Schedules ${r.status}`);
       const jobs = await r.json();
-      const arrays = await Promise.all(jobs.map(j => buildEvents(j, hb)));
+      const arrays = await Promise.all(jobs.map(j => buildEvents(j, hb, schedSettings)));
       setEvents(arrays.flat());
     } catch (e) {
       setError(e.message);
@@ -185,10 +241,22 @@ export default function CalendarView() {
       setLoading(l => ({ ...l, schedules: false }));
     }
   };
+  const loadSettings = async () => {
+    setLoading(l=>({...l, settings:true}));
+    try {
+      const r = await fetch('/api/settings/scheduling');
+      if (!r.ok) throw new Error(`Settings ${r.status}`);
+      const data = await r.json();
+      setSchedSettings(data);
+      if (data.core_start_hour) CORE_START_HOUR = Number(data.core_start_hour)||8;
+      if (data.core_end_hour) CORE_END_HOUR = Number(data.core_end_hour)||16;
+    } catch(e){ setError(e.message); } finally { setLoading(l=>({...l, settings:false})); }
+  };
   const retryAll = () => { setError(null); loadInstallers(); loadHomeBase(); loadSchedules(); };
 
-  useEffect(() => { loadInstallers(); loadHomeBase(); }, []);
-  useEffect(() => { if (homeBase !== undefined) loadSchedules(homeBase); }, [homeBase]);
+  useEffect(() => { loadInstallers(); loadHomeBase(); loadSettings(); }, []);
+  useEffect(() => { if (homeBase !== undefined && schedSettings) loadSchedules(homeBase); }, [homeBase, schedSettings]);
+  useEffect(()=>{ const { dragging, offsetX, offsetY, ...persist } = sidebarState; localStorage.setItem('sidebarState', JSON.stringify(persist)); }, [sidebarState]);
 
   function handleSelectEvent(ev) { setSelected(ev.resource); }
   function handleSelectSlot(slot) {
@@ -307,23 +375,33 @@ export default function CalendarView() {
 
   // Inline edit helpers
   function startInlineEdit(job) {
-    setInlineEdit({ id: job.id, desc: job.description || '', mh: job.man_hours || '', loading: false, error: null });
+    setInlineEdit({ id: job.id, desc: job.description || '', mh: job.man_hours || '', installers: [...(job.installers||[])], loading: false, error: null });
   }
-  function cancelInlineEdit() { setInlineEdit({ id: null, desc: '', mh: '', loading: false, error: null }); }
+  function cancelInlineEdit() { setInlineEdit({ id: null, desc: '', mh: '', installers: [], loading: false, error: null }); }
+  function wouldExceedLimitEditing(job, newInstallerIds, dateStr, newManHours){
+    if (!newInstallerIds || !newInstallerIds.length || !newManHours) return false;
+    const originalMH = Number(job.man_hours) || 0;
+    const originalInstallers = job.installers || [];
+    const perNew = newManHours / newInstallerIds.length;
+    return newInstallerIds.some(installerId => {
+      const currentAssigned = getInstallerAssignedHours(installerId, dateStr) - (originalInstallers.includes(installerId) && originalInstallers.length ? (originalMH / originalInstallers.length) : 0);
+      return currentAssigned + perNew > 8.0001;
+    });
+  }
   async function saveInlineEdit(job) {
     setInlineEdit(ie => ({ ...ie, loading: true, error: null }));
-    // Check limit if man-hours changed and no override
     const newMH = Number(inlineEdit.mh);
-    const jobDate = job.date;
-    if (!overrideDailyLimit && job.installers && job.installers.length && newMH) {
-      const exceedEdit = wouldExceedLimit(job.installers, jobDate, newMH);
+    const jobDate = job.date?.slice(0,10) || '';
+    const newInstallers = inlineEdit.installers && inlineEdit.installers.length ? inlineEdit.installers : (job.installers||[]);
+    if (!overrideDailyLimit && newInstallers.length && newMH) {
+      const exceedEdit = wouldExceedLimitEditing(job, newInstallers, jobDate, newMH);
       if (exceedEdit) {
         setInlineEdit(ie => ({ ...ie, loading: false, error: 'Per-installer limit >8h (enable override)' }));
         return;
       }
     }
     try {
-      const payload = { description: inlineEdit.desc, man_hours: inlineEdit.mh, override: overrideDailyLimit };
+      const payload = { description: inlineEdit.desc, man_hours: inlineEdit.mh, installers: newInstallers, override: overrideDailyLimit };
       const res = await fetch(`/api/schedules/${job.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       if (!res.ok) {
         const body = await res.json().catch(()=>({}));
@@ -334,6 +412,46 @@ export default function CalendarView() {
     } catch(e) {
       setInlineEdit(ie => ({ ...ie, loading: false, error: e.message }));
     }
+  }
+
+  const DnDCalendar = withDragAndDrop(Calendar);
+
+  async function moveEvent({ event, start, end }) {
+    // event.resource is the job; adjust its base date/time to new start (keep same time of day)
+    const job = event.resource;
+    if (!job) return;
+    const original = new Date(job.date || start);
+    const newStart = new Date(start);
+    // Compose new ISO date/time (keep minutes/hours from newStart)
+    const iso = newStart.toISOString().slice(0,16);
+    try {
+      const payload = { date: iso, override: true }; // allow move even if hours shift day allocations
+      const res = await fetch(`/api/schedules/${job.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      if (!res.ok) {
+        const body = await res.json().catch(()=>({}));
+        throw new Error(body.error || `Move failed (${res.status})`);
+      }
+      loadSchedules();
+    } catch(e){ setError(e.message); }
+  }
+
+  async function resizeEvent({ event, start, end }) {
+    // Derive new per-installer hours from duration in hours (clamped >=0)
+    const job = event.resource;
+    if (!job) return;
+    const hours = Math.max(0, (end.getTime() - start.getTime()) / 3600000);
+    // Multiply by installer count to get total man_hours (approx). If multi-part originally, this is a direct edit.
+    const installerCount = Array.isArray(job.installers) && job.installers.length ? job.installers.length : 1;
+    const newTotal = (hours * installerCount).toFixed(2);
+    try {
+      const payload = { man_hours: newTotal, override: true };
+      const res = await fetch(`/api/schedules/${job.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      if (!res.ok) {
+        const body = await res.json().catch(()=>({}));
+        throw new Error(body.error || `Resize failed (${res.status})`);
+      }
+      loadSchedules();
+    } catch(e){ setError(e.message); }
   }
 
   return (
@@ -361,7 +479,7 @@ export default function CalendarView() {
         <button style={{ marginLeft: 8 }} disabled={!jobQuery} onClick={() => selectJobNumber(jobQuery)}>Go</button>
         <button style={{ marginLeft: 8 }} onClick={() => { setShowForm(true); }}>New</button>
       </div>
-      <Calendar
+      <DnDCalendar
         localizer={localizer}
         events={events}
         startAccessor="start"
@@ -370,12 +488,31 @@ export default function CalendarView() {
         popup
         onSelectEvent={handleSelectEvent}
         onSelectSlot={handleSelectSlot}
+        onView={v=>setCurrentView(v)}
+        defaultView={currentView}
+        views={['month','week','day']}
         style={{ height: 500 }}
+        draggableAccessor={() => true}
+        resizable
+        onEventDrop={moveEvent}
+        onEventResize={resizeEvent}
         components={{
           event: ({ event }) => {
             const job = event.resource;
             const isEditing = inlineEdit.id === job.id;
             if (isEditing) {
+              const predictedExceed = !overrideDailyLimit && (() => {
+                const mhNum = Number(inlineEdit.mh);
+                return wouldExceedLimitEditing(job, inlineEdit.installers, job.date?.slice(0,10), mhNum);
+              })();
+              const toggleInstaller = (id) => {
+                setInlineEdit(ie => {
+                  const list = ie.installers || [];
+                  return list.includes(id)
+                    ? { ...ie, installers: list.filter(x => x !== id) }
+                    : { ...ie, installers: [...list, id] };
+                });
+              };
               return (
                 <div style={{ fontSize: 11, lineHeight: 1.3 }} onClick={e => e.stopPropagation()}>
                   <input
@@ -384,7 +521,14 @@ export default function CalendarView() {
                     placeholder="Desc"
                     style={{ width: '100%', marginBottom: 2, fontSize: 11 }}
                   />
-                  <div style={{ display:'flex', gap:4, alignItems:'center' }}>
+                  <div style={{ maxHeight: 52, overflowY: 'auto', border:'1px solid #ffffff33', marginBottom: 2, padding:2 }}>
+                    {installers.map(inst => (
+                      <label key={inst.id} style={{ display:'inline-block', width: '48%', fontSize:9, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>
+                        <input type="checkbox" style={{ marginRight:2 }} checked={(inlineEdit.installers||[]).includes(inst.id)} onChange={()=>toggleInstaller(inst.id)} />{inst.name}
+                      </label>
+                    ))}
+                  </div>
+                  <div style={{ display:'flex', gap:4, alignItems:'center', flexWrap:'wrap' }}>
                     <input
                       type="number"
                       min="0"
@@ -392,20 +536,26 @@ export default function CalendarView() {
                       value={inlineEdit.mh}
                       onChange={e=>setInlineEdit(ie=>({...ie, mh:e.target.value}))}
                       title="Man-Hours"
-                      style={{ width: 50, fontSize:11 }}
+                      style={{ width: 46, fontSize:10 }}
                     />
-                    <button type="button" disabled={inlineEdit.loading} onClick={()=>saveInlineEdit(job)} style={{ fontSize:10 }}>Save</button>
-                    <button type="button" disabled={inlineEdit.loading} onClick={cancelInlineEdit} style={{ fontSize:10 }}>X</button>
+                    <label style={{ fontSize:9, display:'flex', alignItems:'center', gap:2 }} title="Override 8h limit">
+                      <input type="checkbox" checked={overrideDailyLimit} onChange={e=>setOverrideDailyLimit(e.target.checked)} />Ovr
+                    </label>
+                    <button type="button" disabled={inlineEdit.loading} onClick={()=>saveInlineEdit(job)} style={{ fontSize:9 }}>Save</button>
+                    <button type="button" disabled={inlineEdit.loading} onClick={cancelInlineEdit} style={{ fontSize:9 }}>X</button>
                   </div>
-                  {inlineEdit.error && <div style={{ color:'#b71c1c', fontSize:10 }}>{inlineEdit.error}</div>}
+                  {predictedExceed && <div style={{ color:'#ffeb3b', fontSize:9 }}>Would exceed 8h</div>}
+                  {inlineEdit.error && <div style={{ color:'#b71c1c', fontSize:9 }}>{inlineEdit.error}</div>}
                 </div>
               );
             }
             const partsInfo = event.partsTotal > 1 ? `Part ${event.partIndex}/${event.partsTotal} | Slice ${event.partHours}h | Remaining ${event.remainingHours}h of ${event.manHours}h` : `${event.manHours}h total`;
-            const tooltip = `${event.jobLabel} \n${partsInfo}`;
+      const travelInfo = (event.travelOutMinutes || event.travelReturnMinutes) ? `Travel Out: ${event.travelOutMinutes||0}m | Return: ${event.travelReturnMinutes||0}m` : '';
+      const tooltip = `${event.jobLabel} \n${partsInfo}${travelInfo?`\n${travelInfo}`:''}`;
             return (
               <span title={tooltip} style={{ position:'relative', paddingRight:14, display:'inline-block', maxWidth:'100%' }}>
                 {event.jobLabel}
+        {travelInfo && <span style={{ display:'block', fontSize:9, opacity:0.85 }}>{travelInfo}</span>}
                 <button
                   type="button"
                   onClick={(e)=>{ e.stopPropagation(); startInlineEdit(job); }}
@@ -418,38 +568,62 @@ export default function CalendarView() {
         }}
         eventPropGetter={(event) => {
           const style = {
-            backgroundColor: event.color || '#3174ad',
-            border: '1px solid rgba(0,0,0,0.25)',
+            backgroundColor: event.nonCore ? '#555' : (event.color || '#3174ad'),
+            border: event.nonCore ? '1px dashed #222' : '1px solid rgba(0,0,0,0.25)',
             color: '#fff',
             fontSize: 12,
             padding: 2,
             borderRadius: 4,
-            opacity: 0.95
+            opacity: event.nonCore ? 0.8 : 0.95,
+            boxShadow: event.nonCore ? 'inset 0 0 0 2px rgba(255,255,255,0.15)' : undefined
           };
-            return { style };
+          return { style };
         }}
       />
-      {/* Daily hours summary sidebar */}
-      <div style={{ position: 'absolute', top: 0, right: 0, width: 230, height: '100%', background: '#fafafa', borderLeft: '1px solid #ddd', padding: '8px 10px', overflowY: 'auto', fontSize: 11 }}>
-        <h4 style={{ margin: '4px 0 8px', fontSize: 13 }}>Daily Hours</h4>
-        {dailySummary.length === 0 && <div style={{ fontStyle: 'italic' }}>No assignments</div>}
-        {dailySummary.map(day => (
-          <div key={day.day} style={{ marginBottom: 8 }}>
-            <div style={{ fontWeight: 600 }}>{day.day}</div>
-            {day.installers.sort((a,b)=>a.id-b.id).map(rec => {
-              const inst = installers.find(i=>i.id===rec.id);
-              const over = rec.hours > 8.0001;
-              return (
-                <div key={rec.id} style={{ display: 'flex', justifyContent: 'space-between', color: over ? '#b71c1c' : '#222' }}>
-                  <span style={{ maxWidth: 110, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{inst?inst.name:`#${rec.id}`}</span>
-                  <span>{rec.hours.toFixed(1)}h</span>
-                </div>
-              );
-            })}
+      {/* Daily hours summary sidebar - only in Day view, draggable */}
+      {currentView === 'day' && (
+        <div
+          style={{
+            position: 'fixed',
+            top: sidebarState.y ?? 0,
+            left: sidebarState.pinned ? 'auto' : Math.min(Math.max(0, sidebarState.x ?? (window.innerWidth - 230)), window.innerWidth - 240),
+            right: sidebarState.pinned ? 0 : 'auto',
+            width: 230,
+            maxHeight: '90vh',
+            background: '#fafafa',
+            border: '1px solid #ccc',
+            borderRight: sidebarState.pinned ? 'none' : '1px solid #ccc',
+            boxShadow: '0 2px 6px rgba(0,0,0,0.15)',
+            padding: '4px 8px 8px',
+            overflowY: 'auto',
+            fontSize: 11,
+            zIndex: 1500,
+            cursor: sidebarState.dragging ? 'grabbing' : 'default'
+          }}
+        >
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:4 }}>
+            <div onMouseDown={startDragSidebar} style={{ fontWeight:600, fontSize:13, cursor:'grab', userSelect:'none' }}>Daily Hours</div>
+            <button style={{ fontSize:10 }} onClick={()=>setSidebarState(s=>({...s, pinned: !s.pinned, x: s.pinned? (s.x ?? (window.innerWidth - 230)) : null }))}>{sidebarState.pinned? 'Float':'Dock'}</button>
           </div>
-        ))}
-  <div style={{ fontSize: 10, color: '#666' }}>Red &gt; 8h (override).</div>
-      </div>
+          {dailySummary.length === 0 && <div style={{ fontStyle: 'italic' }}>No assignments</div>}
+          {dailySummary.map(day => (
+            <div key={day.day} style={{ marginBottom: 8 }}>
+              <div style={{ fontWeight: 600 }}>{day.day}</div>
+              {day.installers.sort((a,b)=>a.id-b.id).map(rec => {
+                const inst = installers.find(i=>i.id===rec.id);
+                const over = rec.hours > 8.0001;
+                return (
+                  <div key={rec.id} style={{ display: 'flex', justifyContent: 'space-between', color: over ? '#b71c1c' : '#222' }}>
+                    <span style={{ maxWidth: 110, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{inst?inst.name:`#${rec.id}`}</span>
+                    <span>{rec.hours.toFixed(1)}h</span>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+          <div style={{ fontSize: 10, color: '#666' }}>Red &gt; 8h (override).</div>
+        </div>
+      )}
       {(selected || showForm) && (
         <>
           <div onClick={() => { setSelected(null); setShowForm(false); }} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 1000 }} />
