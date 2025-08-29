@@ -176,10 +176,15 @@ export default function CalendarView() {
   const [overrideDailyLimit, setOverrideDailyLimit] = useState(false);
   const [inlineEdit, setInlineEdit] = useState({ id: null, desc: '', mh: '', installers: [], loading: false, error: null });
   const [currentView, setCurrentView] = useState('month');
+  const [currentDate, setCurrentDate] = useState(new Date());
+  const dayMin = React.useMemo(()=>{ const d=new Date(); d.setHours(7,0,0,0); return d;},[]);
+  const scrollToSeven = dayMin; // reuse
   const [sidebarState, setSidebarState] = useState(()=>{
     try { return { dragging:false, offsetX:0, offsetY:0, pinned:true, ...JSON.parse(localStorage.getItem('sidebarState')||'{}') }; } catch { return { dragging:false, x:null, y:null, pinned:true, offsetX:0, offsetY:0 }; }
   });
   const [schedSettings, setSchedSettings] = useState(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [settingsForm, setSettingsForm] = useState({ core_start_hour:'', core_end_hour:'', drive_out_minutes:'', drive_return_minutes:'' });
 
   function startDragSidebar(e){
     e.preventDefault();
@@ -250,6 +255,12 @@ export default function CalendarView() {
       setSchedSettings(data);
       if (data.core_start_hour) CORE_START_HOUR = Number(data.core_start_hour)||8;
       if (data.core_end_hour) CORE_END_HOUR = Number(data.core_end_hour)||16;
+      setSettingsForm(f=>({
+        core_start_hour: data.core_start_hour ?? f.core_start_hour ?? '8',
+        core_end_hour: data.core_end_hour ?? f.core_end_hour ?? '16',
+        drive_out_minutes: data.drive_out_minutes ?? f.drive_out_minutes ?? '0',
+        drive_return_minutes: data.drive_return_minutes ?? f.drive_return_minutes ?? '0'
+      }));
     } catch(e){ setError(e.message); } finally { setLoading(l=>({...l, settings:false})); }
   };
   const retryAll = () => { setError(null); loadInstallers(); loadHomeBase(); loadSchedules(); };
@@ -478,8 +489,9 @@ export default function CalendarView() {
         </label>
         <button style={{ marginLeft: 8 }} disabled={!jobQuery} onClick={() => selectJobNumber(jobQuery)}>Go</button>
         <button style={{ marginLeft: 8 }} onClick={() => { setShowForm(true); }}>New</button>
+  <button style={{ marginLeft: 8 }} onClick={()=> setShowSettings(true)}>Settings</button>
       </div>
-      <DnDCalendar
+  <DnDCalendar
         localizer={localizer}
         events={events}
         startAccessor="start"
@@ -487,12 +499,23 @@ export default function CalendarView() {
         selectable
         popup
         onSelectEvent={handleSelectEvent}
-        onSelectSlot={handleSelectSlot}
-        onView={v=>setCurrentView(v)}
-        defaultView={currentView}
+        onSelectSlot={(slot)=>{
+          handleSelectSlot(slot);
+          // If user clicks a day cell in month/week, optionally drill down to day view
+          if (currentView !== 'day') {
+            setCurrentView('day');
+            if (slot && slot.start) setCurrentDate(new Date(slot.start));
+          }
+        }}
+        view={currentView}
+        date={currentDate}
+        onView={(v)=> setCurrentView(v)}
+        onNavigate={(date)=> setCurrentDate(date)}
         views={['month','week','day']}
         style={{ height: 500 }}
-        draggableAccessor={() => true}
+  draggableAccessor={() => true}
+  min={currentView==='day'? dayMin: undefined}
+  scrollToTime={currentView==='day'? scrollToSeven: undefined}
         resizable
         onEventDrop={moveEvent}
         onEventResize={resizeEvent}
@@ -624,9 +647,9 @@ export default function CalendarView() {
           <div style={{ fontSize: 10, color: '#666' }}>Red &gt; 8h (override).</div>
         </div>
       )}
-      {(selected || showForm) && (
+    {(selected || showForm || showSettings) && (
         <>
-          <div onClick={() => { setSelected(null); setShowForm(false); }} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 1000 }} />
+      <div onClick={() => { setSelected(null); setShowForm(false); setShowSettings(false); }} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 1000 }} />
           {/* Modal */}
           {selected && !showForm && (
             <div style={{ position: 'fixed', top: '10%', left: '50%', transform: 'translateX(-50%)', width: '80%', maxWidth: 760, background: '#fff', borderRadius: 6, boxShadow: '0 4px 16px rgba(0,0,0,0.3)', padding: 20, zIndex: 1001, maxHeight: '78%', overflow: 'auto' }}>
@@ -758,6 +781,48 @@ export default function CalendarView() {
                   <button type="button" style={{ marginLeft: 8 }} onClick={() => setShowForm(false)}>Cancel</button>
                 </div>
               </form>
+            </div>
+          )}
+          {showSettings && (
+            <div style={{ position: 'fixed', top: '12%', left: '50%', transform: 'translateX(-50%)', width: '80%', maxWidth: 480, background: '#fff', borderRadius: 6, boxShadow: '0 4px 16px rgba(0,0,0,0.3)', padding: 20, zIndex: 1001 }}>
+              <h3 style={{ marginTop:0 }}>Scheduling Settings</h3>
+              <form onSubmit={async e=>{ e.preventDefault();
+                const payload = {
+                  core_start_hour: Number(settingsForm.core_start_hour)||0,
+                  core_end_hour: Number(settingsForm.core_end_hour)||0,
+                  drive_out_minutes: Number(settingsForm.drive_out_minutes)||0,
+                  drive_return_minutes: Number(settingsForm.drive_return_minutes)||0
+                };
+                if (payload.core_end_hour <= payload.core_start_hour) { alert('End hour must be greater than start hour'); return; }
+                try {
+                  const res = await fetch('/api/settings/scheduling', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+                  if (!res.ok) throw new Error(`Save failed (${res.status})`);
+                  CORE_START_HOUR = payload.core_start_hour; CORE_END_HOUR = payload.core_end_hour;
+                  setSchedSettings(s=>({...s, ...payload}));
+                  setShowSettings(false);
+                  await loadSchedules();
+                } catch(err){ alert(err.message); }
+              }}>
+                <div style={{ display:'flex', flexWrap:'wrap', gap:16 }}>
+                  <label style={{ flex:'1 1 120px' }}>Core Start Hour<br />
+                    <input type="number" min="0" max="23" value={settingsForm.core_start_hour} onChange={e=>setSettingsForm(f=>({...f, core_start_hour:e.target.value}))} style={{ width:'100%' }} />
+                  </label>
+                  <label style={{ flex:'1 1 120px' }}>Core End Hour<br />
+                    <input type="number" min="0" max="23" value={settingsForm.core_end_hour} onChange={e=>setSettingsForm(f=>({...f, core_end_hour:e.target.value}))} style={{ width:'100%' }} />
+                  </label>
+                  <label style={{ flex:'1 1 140px' }}>Drive Out (min)<br />
+                    <input type="number" min="0" value={settingsForm.drive_out_minutes} onChange={e=>setSettingsForm(f=>({...f, drive_out_minutes:e.target.value}))} style={{ width:'100%' }} />
+                  </label>
+                  <label style={{ flex:'1 1 140px' }}>Drive Return (min)<br />
+                    <input type="number" min="0" value={settingsForm.drive_return_minutes} onChange={e=>setSettingsForm(f=>({...f, drive_return_minutes:e.target.value}))} style={{ width:'100%' }} />
+                  </label>
+                </div>
+                <div style={{ textAlign:'right', marginTop:18 }}>
+                  <button type="submit">Save</button>
+                  <button type="button" style={{ marginLeft:8 }} onClick={()=>setShowSettings(false)}>Cancel</button>
+                </div>
+              </form>
+              <div style={{ marginTop:12, fontSize:11, color:'#555' }}>Changes apply to future slicing immediately after save; existing events are regenerated.</div>
             </div>
           )}
         </>
